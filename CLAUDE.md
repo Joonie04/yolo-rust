@@ -15,7 +15,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 命令
 
 ```bash
-# 三个子命令（CLI 入口在 src/main.rs）
+# CLI 入口（src/main.rs）：缺省 = 配置文件推理；另有一键 flag 模式
+cargo run -- --model models/det/yolo26n.onnx --image data/bus.jpg  # 一键单图推理（出框 + JSON）
 cargo run -- config/config.toml           # 推理（单图/目录/glob/视频/流）
 cargo run -- bench config/bench.toml      # 工程基准 → <bench.dir>/bench_report.json
 cargo run -- eval config/eval.toml        # 精度评估 → <eval.dir>/eval_report.json

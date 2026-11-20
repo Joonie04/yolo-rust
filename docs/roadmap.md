@@ -379,7 +379,7 @@
 
 **完成情况**：
 - **P0 ✅（2026-11-20）**：外层项目 git 化并首次推送 GitHub（`Joonie04/yolo-rust`）。结构整理：`references/` → `vendor/`（vendored 源码，入库）；`third_party/`（预编译二进制 + 下载缓存，gitignore）。重写 `.gitignore`（排除 520M 第三方二进制、`data/{coco2017,eval,equiv}`、`*.onnx/*.pt`、机器路径 `.cargo/config.toml`）。补顶层 `LICENSE`（AGPL-3.0）与 `.cargo/config.toml.example` 模板。
-- **P1（待做）**：① CPU 预编译二进制；② 一键 CLI；④ 陌生人 README + 一键 bench 脚本。
+- **P1（进行中）**：② 一键 CLI ✅（`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON，2026-11-20 实测）；① CPU 预编译二进制（待做）；④ 陌生人 README + 一键 bench 脚本（待做）。
 - **P2（待做）**：Docker CPU 镜像、GitHub Actions 三平台 CI + Release。
 - **P3（待做）**：三平台二进制端到端 smoke。
 

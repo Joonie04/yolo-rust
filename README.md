@@ -5,6 +5,17 @@
 
 ## 快速开始
 
+**最快上手**：单图推理，无需写配置文件，直接出框 + JSON。
+
+```bash
+cargo run -- --model models/det/yolo26n.onnx --image data/bus.jpg
+```
+
+控制台打印 `4 persons, 1 bus` 这类检测摘要，并在 `results/detect/<时间戳>/` 落盘 `results.json` + 标注图。
+（编译产物直接跑是 `yolo-rust --model <x.onnx> --image <y.jpg>`；可加 `--device cuda:0`、`--conf 0.25`、`--iou 0.7`。）
+
+完整用法（配置文件，功能最全）：
+
 ```bash
 # 1. 导出模型（.pt -> .onnx，需已装 ultralytics 的环境，如 yolo_algorithm_26）
 #    python utils/export_onnx.py models/det/yolo26n.pt models/seg/yolo26n-seg.pt
