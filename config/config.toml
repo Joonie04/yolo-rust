@@ -1,0 +1,31 @@
+# YOLO 推理项目默认配置
+# 用法: cargo run -- config/config.toml
+
+[model]
+# ONNX 模型路径（.pt 权重需先用 ultralytics 导出为 .onnx）
+path = "models/depth/yolo26m-depth.onnx"
+
+[source]
+# 源类型: image | directory | glob | video | webcam | stream
+type = "image"
+path = "data/depth/kids.jpg"
+
+[inference]
+device = "cpu"          # cpu | cuda:0 | tensorrt:0 | directml:0 | coreml | intel:gpu | rocm:0 | xnnpack
+conf = 0.25             # 置信度阈值
+iou = 0.7               # NMS IoU
+max_det = 300           # 每图最大检测数
+threads = 0             # 0 = 全部核心
+rect = true             # 矩形推理（最小 padding）
+# imgsz = [640, 640]    # 缺省用模型元数据
+# batch = 1
+# quantize = "fp16"     # 8/16/32/int8/fp16/fp32/w8a8/w16a16/w32a32/w8a16/w8a32
+# classes = [0, 2]      # 只保留这些类别 ID
+
+[output]
+save_annotated = true   # 保存标注图
+save_json = true        # 保存结构化 JSON
+dir = "results"         # 输出根目录（自动追加 <task>/<时间戳>/）
+
+[logging]
+verbose = true          # 打印每张图的详细摘要

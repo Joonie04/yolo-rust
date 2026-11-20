@@ -1,0 +1,12 @@
+# 复制本文件为 .cargo/config.toml 并按本机路径修改。
+# .cargo/config.toml 本身不入库（见 .gitignore），因为它含机器相关的绝对路径。
+#
+# 仅 Windows 开发机需要（FFmpeg vendored + bindgen 的 libclang）；
+# Linux 构建由 utils/stage_linux_upload.ps1 生成无 [env] 的干净版（pkg-config / 系统 libclang 自动探测）。
+#
+# 注意：Cargo 的 [env] 只能写在顶层，不支持按 cfg 作用域（见 docs/plan.md / CLAUDE.md）。
+[env]
+# 指向 vendored 的 FFmpeg 开发文件（utils/setup_ffmpeg.ps1 拉取解压到 third_party/ffmpeg/）
+FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }
+# 改成你本机 libclang 所在目录（Anaconda / LLVM 的 bin/ 均可）
+LIBCLANG_PATH = { value = "D:/anaconda3/Library/bin" }

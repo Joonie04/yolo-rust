@@ -1,0 +1,25 @@
+# 实例分割示例
+# 用法: cargo run -- config/segment.toml
+
+[model]
+path = "models/seg/yolo26n-seg.onnx"
+
+[source]
+type = "image"
+path = "data/bus.jpg"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[output]
+save_annotated = true
+save_json = true
+dir = "results"
+
+[logging]
+verbose = true

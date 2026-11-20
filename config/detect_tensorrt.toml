@@ -1,0 +1,25 @@
+# 检测示例（TensorRT fp32），用于与 detect_tensorrt_fp16.toml 对比量化精度。
+# 用法: cargo run --release --features "cuda tensorrt" -- config/detect_tensorrt.toml
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[source]
+type = "image"
+path = "data/bus.jpg"
+
+[inference]
+device = "tensorrt:0"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[output]
+save_annotated = false
+save_json = true
+dir = "results/detect_tensorrt"
+
+[logging]
+verbose = false

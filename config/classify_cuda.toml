@@ -1,0 +1,21 @@
+# 图像分类示例（CUDA fp32），用于服务器全任务冒烟验证。
+# 用法: cargo run --release --features cuda -- config/classify_cuda.toml
+
+[model]
+path = "models/cls/yolo26n-cls.onnx"
+
+[source]
+type = "image"
+path = "data/bus.jpg"
+
+[inference]
+device = "cuda:0"
+threads = 0
+
+[output]
+save_annotated = false
+save_json = true
+dir = "results/classify_cuda"
+
+[logging]
+verbose = false

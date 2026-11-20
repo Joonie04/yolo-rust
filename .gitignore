@@ -1,0 +1,20 @@
+# 构建产物
+/target
+
+# 运行输出
+/results
+
+# 预编译第三方二进制 + 下载缓存（体积大，走脚本拉取，不入库）
+/third_party
+
+# 机器相关构建配置（含绝对路径 LIBCLANG_PATH，见 .cargo/config.toml.example 模板）
+/.cargo/config.toml
+
+# 模型权重（.onnx / .pt），体积大，可由 utils/export_onnx.py 或下载复现
+*.onnx
+*.pt
+
+# 大型评估数据集（本地复现用，不入库）
+/data/coco2017/
+/data/eval/
+/data/equiv/

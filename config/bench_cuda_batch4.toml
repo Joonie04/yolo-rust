@@ -1,0 +1,24 @@
+# 工程基准（CUDA GPU，batch=4，测吞吐随 batch 的变化）。
+# 用法: cargo run --release --features cuda -- bench config/bench_cuda_batch4.toml
+# 输出: results/bench_report.json（与 bench_cuda.toml batch=1 对比）
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[source]
+type = "directory"
+path = "data/bench"
+
+[inference]
+device = "cuda:0"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+batch = 4
+
+[bench]
+warmup = 3
+iterations = 20
+dir = "results/bench_cuda_batch4"

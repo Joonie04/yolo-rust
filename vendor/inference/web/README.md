@@ -1,0 +1,382 @@
+<!-- Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license -->
+
+<div align="center">
+  <p>
+    <a href="https://www.ultralytics.com/yolo/yolo27?utm_source=github&utm_medium=social&utm_campaign=yolo27-launch-2026&utm_content=banner" target="_blank">
+      <img width="100%" src="https://raw.githubusercontent.com/ultralytics/assets/main/yolov8/banner-yolov8.png" alt="Ultralytics YOLO banner"></a>
+  </p>
+
+[中文](https://docs.ultralytics.com/zh) | [한국어](https://docs.ultralytics.com/ko) | [日本語](https://docs.ultralytics.com/ja) | [Русский](https://docs.ultralytics.com/ru) | [Deutsch](https://docs.ultralytics.com/de) | [Français](https://docs.ultralytics.com/fr) | [Español](https://docs.ultralytics.com/es) | [Português](https://docs.ultralytics.com/pt) | [Türkçe](https://docs.ultralytics.com/tr) | [Tiếng Việt](https://docs.ultralytics.com/vi) | [العربية](https://docs.ultralytics.com/ar) <br>
+
+</div>
+
+# Ultralytics YOLO npm Inference
+
+<div align="center">
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+</div>
+
+<div align="center">
+
+[![npm version](https://img.shields.io/npm/v/@ultralytics/yolo?logo=npm&logoColor=white&label=npm&color=CB3837)](https://www.npmjs.com/package/@ultralytics/yolo)
+[![npm downloads](https://img.shields.io/npm/dm/@ultralytics/yolo?logo=npm&logoColor=white&label=downloads&color=CB3837)](https://www.npmjs.com/package/@ultralytics/yolo)
+[![CI](https://github.com/ultralytics/inference/actions/workflows/ci.yml/badge.svg)](https://github.com/ultralytics/inference/actions/workflows/ci.yml)
+[![License](https://img.shields.io/npm/l/@ultralytics/yolo?label=license&color=blue)](https://github.com/ultralytics/inference/blob/main/LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.03748-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2606.03748)
+
+[![Ultralytics Discord](https://img.shields.io/discord/1089800235347353640?logo=discord&logoColor=white&label=Discord&color=blue)](https://discord.com/invite/ultralytics)
+[![Ultralytics Forums](https://img.shields.io/discourse/users?server=https%3A%2F%2Fcommunity.ultralytics.com&logo=discourse&label=Forums&color=blue)](https://community.ultralytics.com)
+[![Ultralytics Reddit](https://img.shields.io/reddit/subreddit-subscribers/ultralytics?style=flat&logo=reddit&logoColor=white&label=Reddit&color=blue)](https://www.reddit.com/r/Ultralytics/)
+
+</div>
+
+Run [Ultralytics](https://www.ultralytics.com) YOLO models directly in the browser, with no server and no Python. It runs on **WebGPU** (with an automatic CPU/wasm fallback) and covers [object detection](https://docs.ultralytics.com/tasks/detect), [instance segmentation](https://docs.ultralytics.com/tasks/segment), [semantic segmentation](https://docs.ultralytics.com/tasks/semantic), [depth estimation](https://docs.ultralytics.com/tasks/depth), [image classification](https://docs.ultralytics.com/tasks/classify), [pose estimation](https://docs.ultralytics.com/tasks/pose), and [oriented bounding boxes](https://docs.ultralytics.com/tasks/obb), behind a small TypeScript API with a built-in `annotate()` that draws results straight to a canvas.
+
+```ts
+import { YOLO, annotate } from "@ultralytics/yolo";
+
+const model = await YOLO.load("/models/yolo26n.onnx");
+const results = await model.predict("bus.jpg");
+await annotate(document.querySelector("canvas"), "bus.jpg", results);
+```
+
+It is a **library only** (no CLI; that is the native Rust crate). Under the hood
+the engine is the `ultralytics-inference` Rust crate compiled to WebAssembly.
+Inference runs on [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/)
+via [`ort-web`](https://ort.pyke.io/backends/web), and all pre/postprocessing,
+colors, and the pose skeleton come from that shared Rust code, so results and
+visuals match the native and Python paths.
+
+## 📦 Install
+
+```bash
+npm install @ultralytics/yolo
+# or
+pnpm add @ultralytics/yolo
+yarn add @ultralytics/yolo
+bun add @ultralytics/yolo
+```
+
+It ships as an ES module with TypeScript types and works in any modern bundler
+(Vite, webpack, esbuild, Bun) or directly via a CDN such as
+[esm.sh](https://esm.sh/@ultralytics/yolo).
+
+## 🚀 Quick Start
+
+```ts
+import { YOLO, annotate } from "@ultralytics/yolo";
+
+// Loads the model and initializes WebGPU + ONNX Runtime Web on first use.
+const model = await YOLO.load("/models/yolo26n.onnx");
+
+const results = await model.predict("bus.jpg");
+for (const box of results.boxes) {
+  console.log(box.name, box.conf.toFixed(2), [box.x1, box.y1, box.x2, box.y2]);
+}
+
+// Draw boxes, OBB, pose, and labels onto a canvas in one call (no canvas code).
+await annotate(document.querySelector("canvas"), "bus.jpg", results);
+```
+
+`predict()` accepts a URL/path, a `Blob`/`File`, raw encoded image bytes
+(`Uint8Array`/`ArrayBuffer`), `ImageData`, an `HTMLImageElement`,
+`HTMLCanvasElement`, `HTMLVideoElement`, or an `ImageBitmap`.
+
+```ts
+const results = await model.predict(canvas, { conf: 0.25, iou: 0.7 });
+console.log(model.device); // "webgpu" or "cpu"
+```
+
+Pass `classes: [0, 2]` to keep only those class ids.
+
+`YOLO.load` also takes a `Blob`/`File`, so you can load a model the user drops or
+picks. The backend is detected from the bytes, so the same call handles `.onnx`
+and `.tflite`:
+
+```ts
+const model = await YOLO.load(fileInput.files[0]); // a dropped/picked .onnx or .tflite
+```
+
+### Webcam / Video
+
+Drawable sources (`<video>`, canvas, `ImageBitmap`, `ImageData`) take a
+raw-pixel fast path with no re-encoding, so a render loop is smooth:
+
+```ts
+const model = await YOLO.load("/models/yolo26n.onnx");
+async function frame() {
+  const results = await model.predict(video); // <video> element
+  await annotate(canvas, video, results);
+  requestAnimationFrame(frame);
+}
+```
+
+## ✨ Models
+
+<a href="https://docs.ultralytics.com/tasks" target="_blank">
+    <img width="100%" src="https://cdn.ul.run/i/c99d914c3958d0755b5a3d7204b6f24a.avif" alt="Ultralytics YOLO supported tasks">
+</a>
+<br>
+<br>
+
+Runs [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8),
+[Ultralytics YOLO11](https://docs.ultralytics.com/models/yolo11), and
+[Ultralytics YOLO26](https://docs.ultralytics.com/models/yolo26) ONNX exports for
+[detection](https://docs.ultralytics.com/tasks/detect),
+[segmentation](https://docs.ultralytics.com/tasks/segment),
+[semantic segmentation](https://docs.ultralytics.com/tasks/semantic),
+[depth estimation](https://docs.ultralytics.com/tasks/depth),
+[classification](https://docs.ultralytics.com/tasks/classify),
+[pose](https://docs.ultralytics.com/tasks/pose), and
+[OBB](https://docs.ultralytics.com/tasks/obb).
+
+`YOLO.load` takes a URL or path, which the browser fetches like any other asset. Download the weights you want from the [Ultralytics assets release](https://github.com/ultralytics/assets/releases) (the same files the native crate and Python use) and host them **same-origin**, or behind a CORS-enabled origin:
+
+```ts
+await YOLO.load("/models/yolo26n.onnx");
+```
+
+GitHub release assets send no `Access-Control-Allow-Origin`, so a browser cannot fetch them from the release URL directly. That URL works for the native crate and Python, which are not subject to CORS, but not here.
+
+## 📐 Results Shape
+
+`predict()` resolves to a `Results` object whose field names match the
+Rust/Ultralytics `Results` API one-to-one:
+
+| Field              | Type                                                                 | Tasks                 |
+| ------------------ | -------------------------------------------------------------------- | --------------------- |
+| `task`             | `string`                                                             | all                   |
+| `width` / `height` | `number`                                                             | all                   |
+| `boxes`            | `{ x1, y1, x2, y2, conf, cls, name, color }[]`                       | detect, segment, pose |
+| `obb`              | `{ x, y, w, h, angle, conf, cls, name, color }[]`                    | obb                   |
+| `keypoints`        | `{ points: [x, y, conf][], color }[]`                                | pose                  |
+| `probs`            | `{ top1, top5, top1conf, top5conf, name, top5names, color } \| null` | classify              |
+| `masks`            | `Uint8Array` (RGBA overlay, `width*height*4`)                        | segment, semantic     |
+| `semantic_mask`    | `Uint16Array` (class id per pixel, `width*height`)                   | semantic              |
+| `depth`            | `Uint8Array` (opaque colorized depth map, `width*height*4`)          | depth                 |
+| `depth_range`      | `[min, max]` in meters                                               | depth                 |
+| `speed`            | `{ preprocess, inference, postprocess }` ms                          | all                   |
+
+`model.names` is the class id to name map (like `model.names` in Python). Every
+detection carries its Ultralytics palette `color`, and `annotate()` draws the
+`masks` overlay and the pose skeleton with the same per-limb/keypoint colors as
+the native renderer. None of this is duplicated in JS.
+
+For the `depth` task, `predict(img, { colormap, depthViz })` picks the colormap
+(`"jet"` default, `"inferno"`, `"spectral"`, `"gray"`) and normalization
+(`"disparity"` default, `"metric"`); `annotate()` blends the returned map over the
+frame at `depthAlpha` (default `0.6`, `1` shows the raw map):
+
+```ts
+const results = await model.predict(img, { colormap: "spectral", depthViz: "metric" });
+await annotate(canvas, img, results, { depthAlpha: 0.6 });
+```
+
+## ⚙️ Requirements & Notes
+
+- **WebGPU** (Chrome/Edge, or Firefox with WebGPU enabled) from a **secure
+  context** (`https://` or `http://localhost`) gives the fast path. Without
+  WebGPU (older browsers, some phones), `YOLO.load` automatically falls back to a
+  portable **CPU/wasm** build that runs everywhere. Pick the device with
+  `YOLO.load("/models/yolo26n.onnx", { device: "webgpu" | "cpu" })` (default `"auto"`). If
+  WebGPU cannot engage, the load falls back to CPU; `model.device` reports what
+  actually ran.
+- **RT-DETR**: supported for detection. An RT-DETR `.onnx` runs on WebGPU like any other
+  model. An RT-DETR `.tflite` is routed to CPU/wasm under the default `device: "auto"`: its
+  deformable-attention decoder reshapes to rank 5 and indexes with `int64`, which the LiteRT
+  WebGPU delegate rejected on every driver tested (Linux/Vulkan and Apple Metal-3). An
+  explicit `device: "webgpu"` is still attempted rather than overridden, so the delegate can
+  be re-tested as it gains ops; on current drivers that attempt fails and LiteRT falls back
+  to CPU/wasm, and `model.device` reports what ran. Export one yourself, since no RT-DETR
+  ONNX or LiteRT model is published.
+- **Model format**: export your model to ONNX with Ultralytics `>=8.4.142` so the metadata
+  (task, class names, `imgsz`) is embedded:
+
+  ```python
+  from ultralytics import YOLO
+
+  YOLO("yolo26n.pt").export(format="onnx")  # FP32 (default)
+  YOLO("yolo26n.pt").export(format="onnx", quantize=16)  # FP16 (~50% smaller)
+  ```
+
+  For detect, segment, pose, and OBB, `nms=None` (the default) exports raw outputs
+  for NMS in Rust; `nms=False` selects the NMS-free head when available (e.g. YOLO26);
+  `nms=True` embeds NMS in the ONNX graph. Use `nms=None` for semantic, depth, and classify.
+  Existing compatible ONNX files do not need re-exporting.
+
+  > Ultralytics ≥8.4 uses the `quantize` argument instead of the deprecated
+  > `half=True` / `int8=True` flags. For ONNX the supported values are
+  > `32`/`fp32` (default), `16`/`fp16`, and `8`/`int8`; the old flags still work
+  > but emit a deprecation warning.
+
+- **Runtime assets**: on first load, `ort-web` fetches the ONNX Runtime Web wasm
+  bundle (~25 MB, browser-cached afterward) from `cdn.pyke.io`. If you set a
+  Content-Security-Policy, allow that origin in `script-src`/`connect-src`. To
+  avoid the CDN entirely, self-host the runtime and point to it:
+  ```ts
+  const model = await YOLO.load("/models/yolo26n.onnx", { ortBaseUrl: "/ort/" });
+  ```
+  The folder must contain the ONNX Runtime Web entry scripts (`ort.webgpu.min.js`
+  and `ort.wasm.min.js` for the CPU fallback) plus the
+  `ort-wasm-simd-threaded.{jsep,asyncify,}.{mjs,wasm}` binaries.
+- **Telemetry**: `ort-web` reports the page domain to pyke on first session
+  creation. See the [ort-web docs](https://ort.pyke.io/backends/web) to review or
+  disable it.
+
+## ⚡ LiteRT.js backend
+
+An alternative inference engine that runs an Ultralytics **`.tflite`** export
+through [**LiteRT.js**](https://developers.google.com/edge/litert/web) (Google's
+LiteRT for Web), which runs detection and segmentation **1.2 to 1.5× faster than ONNX Runtime Web
+on WebGPU and 1.6 to 2× faster on CPU** (see Benchmarks below).
+Only the inference engine changes; the preprocessing, postprocessing, drawing,
+and `Results` shape are the same shared Rust code, so output matches the `ort`
+path.
+
+The backend is picked from the file extension, falling back to sniffing the `TFL3`
+magic bytes: a `.tflite` runs on LiteRT.js, a `.onnx` on ONNX Runtime Web. The LiteRT.js wasm loads from a CDN by default, so
+the only setup is making `@litertjs/core` resolve (along with its `@litertjs/wasm-utils`
+dependency, which npm installs automatically and the import map below lists explicitly).
+
+**With npm (a bundler):**
+
+```bash
+npm install @ultralytics/yolo @litertjs/core
+```
+
+```ts
+import { YOLO, annotate } from "@ultralytics/yolo";
+
+const model = await YOLO.load("/models/yolo26n.tflite"); // .tflite -> LiteRT.js
+const results = await model.predict("bus.jpg");
+await annotate(document.querySelector("canvas"), "bus.jpg", results);
+```
+
+**Without a build step (CDN):** map the modules to a CDN, then use the exact same
+code as above:
+
+```html
+<script type="importmap">
+  {
+    "imports": {
+      "@ultralytics/yolo": "https://esm.sh/@ultralytics/yolo",
+      "@litertjs/core": "https://esm.sh/@litertjs/core",
+      "@litertjs/wasm-utils": "https://esm.sh/@litertjs/wasm-utils"
+    }
+  }
+</script>
+```
+
+For webcam or video, pass the `<video>` element each frame:
+
+```ts
+const results = await model.predict(video);
+await annotate(canvas, video, results);
+```
+
+The wasm loads from the jsDelivr CDN by default; pass `litertWasmUrl: "/litert/"` to
+`YOLO.load` to self-host it (copy `node_modules/@litertjs/core/wasm/`).
+
+Notes:
+
+- **Model**: export with Ultralytics to `.tflite` (float32 for WebGPU). It loads
+  from the single file. The metadata (task, class names, `imgsz`, stride) is read
+  straight from the `.tflite`, the same as the `.onnx` path. No sidecar.
+- **Existing model compatibility**: the single-file LiteRT export (with
+  embedded metadata) ships in
+  [v8.4.83](https://github.com/ultralytics/ultralytics/releases/tag/v8.4.83) and
+  later. Earlier versions emit the legacy TFLite format and won't load here.
+- **Keep the one-to-many head for WebGPU** (`nms=None`): the NMS-free YOLO26 head, exported
+  with `nms=False`, has `int64` / `gather_nd` ops the LiteRT **WebGPU** delegate cannot
+  run, so those exports fall back to CPU/wasm. Use Ultralytics `>=8.4.142` for this recipe; it exports
+  the one-to-many head by default, so NMS runs in this package's Rust and inference stays
+  on WebGPU:
+
+  ```bash
+  yolo export model=yolo26n.pt format=litert nms=None
+  ```
+
+  If you load an NMS-free `.tflite`, the backend auto-switches it to wasm
+  (slower) and logs a warning rather than returning empty results.
+
+- **Tasks**: detect, segment, semantic, depth, classify, pose, and obb are all supported.
+- **Cross-origin isolation**: LiteRT's threaded wasm wants `SharedArrayBuffer`,
+  so serve with `Cross-Origin-Opener-Policy: same-origin` and
+  `Cross-Origin-Embedder-Policy: require-corp`.
+
+## 🏎️ Benchmarks
+
+Mean inference time per image (ms, lower is better) reported by `results.speed.inference`, LiteRT.js (`.tflite`) vs
+ONNX Runtime Web (`.onnx`):
+
+| Model   | Task    | WebGPU LiteRT (ms) | WebGPU ONNX (ms) | CPU LiteRT (ms) | CPU ONNX (ms) |
+| ------- | ------- | -----------------: | ---------------: | --------------: | ------------: |
+| YOLO11n | detect  |            **9.6** |             14.7 |        **26.7** |          45.8 |
+| YOLO11n | segment |           **13.8** |             19.8 |        **37.9** |          66.0 |
+| YOLO26n | detect  |            **9.3** |             14.0 |        **24.2** |          38.5 |
+| YOLO26n | segment |           **13.8** |             19.7 |        **36.6** |          62.7 |
+| YOLO26x | detect  |          **151.2** |            176.4 |       **560.3** |        1138.6 |
+| YOLO26x | segment |          **187.1** |            285.5 |       **910.5** |        1698.7 |
+
+Apple M4, Chrome 153, `@ultralytics/yolo` 0.0.48 (ONNX Runtime Web 1.27, LiteRT.js 2.5.3). FP32 640×640 models
+exported with Ultralytics 8.4.163 (`nms=None`), cycling through the 128 COCO128 images after warmup (128 timed runs on
+WebGPU, 50 on CPU). NMS-free exports (`nms=False`) run at the same speed on ONNX Runtime Web, but LiteRT.js falls back
+to CPU/wasm for them, so keep `nms=None` for WebGPU.
+
+## 🔨 Building From Source
+
+This package builds the wasm from the Rust crate with
+[`wasm-pack`](https://github.com/wasm-bindgen/wasm-pack):
+
+```bash
+npm run build # wasm-pack build + tsc
+```
+
+Serve the built package over `localhost` (a secure context) with the two
+cross-origin isolation headers above, then open it in a WebGPU browser.
+
+## 💡 Contribute
+
+Ultralytics thrives on community collaboration, and we deeply value your contributions! Whether it's reporting bugs,
+suggesting features, or submitting code changes, your involvement is crucial.
+
+- **Report Issues**: Found a bug? [Open an issue](https://github.com/ultralytics/inference/issues)
+- **Feature Requests**: Have an idea? [Share it](https://github.com/ultralytics/inference/issues)
+- **Pull Requests**: Read our [Contributing Guide](https://docs.ultralytics.com/help/contributing) first
+- **Feedback**: Take our [Survey](https://www.ultralytics.com/survey?utm_source=github&utm_medium=social&utm_campaign=Survey)
+
+A heartfelt thank you 🙏 goes out to all our contributors! Your efforts help make Ultralytics tools better for everyone.
+
+[![Ultralytics open-source contributors](https://raw.githubusercontent.com/ultralytics/assets/main/im/image-contributors.png)](https://github.com/ultralytics/ultralytics/graphs/contributors)
+
+## 📄 License
+
+Ultralytics offers two licensing options to suit different needs:
+
+- **AGPL-3.0 License**: This [OSI-approved](https://opensource.org/license/agpl-3.0) open-source license is perfect for students, researchers, and enthusiasts. It encourages open collaboration and knowledge sharing. See the [LICENSE](https://github.com/ultralytics/inference/blob/main/LICENSE) file for full details.
+- **Ultralytics Enterprise License**: Designed for commercial use, this license allows for the seamless integration of Ultralytics software and AI models into commercial products and services, bypassing the open-source requirements of AGPL-3.0. If your use case involves commercial deployment, please contact us via [Ultralytics Licensing](https://www.ultralytics.com/license).
+
+## 📮 Contact
+
+- **GitHub Issues**: [Bug reports and feature requests](https://github.com/ultralytics/inference/issues)
+- **Discord**: [Join our community](https://discord.com/invite/ultralytics)
+- **Documentation**: [docs.ultralytics.com](https://docs.ultralytics.com)
+
+<br>
+<div align="center">
+  <a href="https://github.com/ultralytics"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-github.png" width="3%" alt="Ultralytics GitHub"></a>
+  <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
+  <a href="https://www.linkedin.com/company/ultralytics/"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-linkedin.png" width="3%" alt="Ultralytics LinkedIn"></a>
+  <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
+  <a href="https://x.com/ultralytics"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-twitter.png" width="3%" alt="Ultralytics Twitter"></a>
+  <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
+  <a href="https://www.youtube.com/ultralytics?sub_confirmation=1"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-youtube.png" width="3%" alt="Ultralytics YouTube"></a>
+  <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
+  <a href="https://www.tiktok.com/@ultralytics"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-tiktok.png" width="3%" alt="Ultralytics TikTok"></a>
+  <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
+  <a href="https://ultralytics.com/bilibili"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-bilibili.png" width="3%" alt="Ultralytics BiliBili"></a>
+  <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
+  <a href="https://discord.com/invite/ultralytics"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-discord.png" width="3%" alt="Ultralytics Discord"></a>
+</div>

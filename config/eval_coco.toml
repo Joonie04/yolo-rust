@@ -1,0 +1,24 @@
+# COCO val2017 精度评估（detect，等价性验证）。
+# 用法: cargo run -- eval config/eval_coco.toml
+# 输出: results/eval_report.json
+#
+# 对齐 Ultralytics model.val() 参数：conf=0.001 / iou=0.7 / max_det=300 / rect=false。
+# 参考值由 utils/run_val_reference.py 生成（data/equiv/coco_val_reference.json）。
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[dataset]
+images = "data/coco2017/images/val2017"
+annotations = "data/coco2017/annotations_trainval2017/annotations/instances_val2017.json"
+
+[inference]
+device = "cpu"
+conf = 0.001
+iou = 0.7
+max_det = 300
+threads = 0
+rect = false
+
+[eval]
+dir = "results"

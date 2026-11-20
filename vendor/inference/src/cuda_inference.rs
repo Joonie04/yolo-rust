@@ -1,0 +1,768 @@
+// Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+//! Internal GPU preprocess for the `cuda-preprocess` feature.
+//!
+//! Implements a fused CUDA kernel that performs bilinear letterbox-resize +
+//! `/255` normalize + (optional) BGR↔RGB swap + HWC→CHW packing in a single
+//! launch, writing directly into the device-side input buffer that ONNX
+//! Runtime's TRT/CUDA EP reads in place.
+//!
+//! The whole module is `pub(crate)` - public API consumers reach this path
+//! through [`crate::YOLOModel`] + [`crate::InferenceConfig`]'s
+//! `with_cuda_preprocess` flag.
+
+#![allow(unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    // `pub(crate)` here documents intent (these types are crate-internal API
+    // for `model.rs`); the module just happens to be private too.
+    clippy::redundant_pub_crate
+)]
+
+use std::sync::Arc;
+
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
+    PinnedHostSlice, PushKernelArg,
+};
+use cudarc::nvrtc::compile_ptx_with_opts;
+
+use crate::error::{InferenceError, Result};
+
+/// CUDA preprocess kernel source (NVRTC-compiled once per `CudaPreprocessor`).
+///
+/// Reads BGR/RGB HWC u8 input, writes RGB CHW f32 in `[0,1]` with letterbox padding.
+/// `bgr_in=1` for OpenCV-style BGR inputs, `bgr_in=0` for RGB inputs (e.g. from the
+/// `image` crate's `to_rgb8`).
+const KERNEL_SRC: &str = r#"
+extern "C" __global__ void preprocess(
+    const unsigned char* __restrict__ src,
+    int src_h, int src_w,
+    float* __restrict__ dst,
+    int dst_h, int dst_w,
+    float scale_x, float scale_y,
+    int valid_w, int valid_h,
+    int pad_x, int pad_y,
+    int bgr_in)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dst_w || y >= dst_h) return;
+
+    int rx = x - pad_x;
+    int ry = y - pad_y;
+
+    float r, g, b;
+    if (rx < 0 || ry < 0 || rx >= valid_w || ry >= valid_h) {
+        r = g = b = 114.0f / 255.0f;
+    } else {
+        // Half-pixel convention: src = (dst + 0.5) * (src / resized) - 0.5, matching the
+        // CPU letterbox in preprocessing.rs and cv2's `INTER_LINEAR`. The ratios are
+        // per-axis and derived from the *rounded* resized extents, so a uniform
+        // 1 / letterbox-scale is not equivalent on the padded axis.
+        float fx = ((float)rx + 0.5f) * scale_x - 0.5f;
+        float fy = ((float)ry + 0.5f) * scale_y - 0.5f;
+        if (fx < 0.f) fx = 0.f;
+        if (fy < 0.f) fy = 0.f;
+        if (fx > (float)(src_w - 1)) fx = (float)(src_w - 1);
+        if (fy > (float)(src_h - 1)) fy = (float)(src_h - 1);
+
+        int x0 = (int)fx;
+        int y0 = (int)fy;
+        int x1 = x0 + 1; if (x1 > src_w - 1) x1 = src_w - 1;
+        int y1 = y0 + 1; if (y1 > src_h - 1) y1 = src_h - 1;
+        float dx = fx - (float)x0;
+        float dy = fy - (float)y0;
+
+        const unsigned char* p00 = src + (y0 * src_w + x0) * 3;
+        const unsigned char* p01 = src + (y0 * src_w + x1) * 3;
+        const unsigned char* p10 = src + (y1 * src_w + x0) * 3;
+        const unsigned char* p11 = src + (y1 * src_w + x1) * 3;
+
+        float w00 = (1.f - dx) * (1.f - dy);
+        float w01 =        dx  * (1.f - dy);
+        float w10 = (1.f - dx) *        dy ;
+        float w11 =        dx  *        dy ;
+
+        int ir = bgr_in ? 2 : 0;
+        int ig = 1;
+        int ib = bgr_in ? 0 : 2;
+
+        float inv255 = 1.0f / 255.0f;
+        r = (w00 * p00[ir] + w01 * p01[ir] + w10 * p10[ir] + w11 * p11[ir]) * inv255;
+        g = (w00 * p00[ig] + w01 * p01[ig] + w10 * p10[ig] + w11 * p11[ig]) * inv255;
+        b = (w00 * p00[ib] + w01 * p01[ib] + w10 * p10[ib] + w11 * p11[ib]) * inv255;
+    }
+
+    int hw = dst_h * dst_w;
+    int idx = y * dst_w + x;
+    dst[0 * hw + idx] = r;
+    dst[1 * hw + idx] = g;
+    dst[2 * hw + idx] = b;
+}
+"#;
+
+/// Geometry produced by [`CudaPreprocessor::preprocess`].
+///
+/// `scale` is the uniform letterbox scale factor; `pad_x`/`pad_y` are the
+/// pixel offsets applied along each axis. These values are needed by
+/// post-processing to map model-space coordinates back to source pixels.
+pub(crate) struct PreGeom {
+    pub scale: (f32, f32),
+    pub pad_x: i32,
+    pub pad_y: i32,
+}
+
+/// Phase-1 of the fast-path init: a cudarc context + stream created before
+/// the ORT session is built, so the raw stream pointer can be handed to the
+/// TRT/CUDA EPs via `with_compute_stream`. Phase-2 ([`CudaPreprocessor::finalize`])
+/// happens after the session is committed and the model's input size is known.
+pub(crate) struct CudaStreamHandle {
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    device_id: usize,
+}
+
+impl CudaStreamHandle {
+    /// Open a CUDA context on `device_id` and take its default stream.
+    pub(crate) fn open(device_id: usize) -> Result<Self> {
+        let ctx = CudaContext::new(device_id).map_err(|e| {
+            InferenceError::ModelLoadError(format!("cudarc CudaContext::new({device_id}): {e:?}"))
+        })?;
+        // A real (non-blocking) stream, never `default_stream()`: that one carries a NULL
+        // `CUstream`, and ORT reads a null `user_compute_stream` as "none given" and runs
+        // the session on a stream of its own. The preprocess kernels would then be
+        // unordered against inference, which reads the input buffer before they land.
+        let stream = ctx.new_stream().map_err(|e| {
+            InferenceError::ModelLoadError(format!("cudarc new_stream({device_id}): {e:?}"))
+        })?;
+        Ok(Self {
+            ctx,
+            stream,
+            device_id,
+        })
+    }
+
+    /// Raw cudarc stream pointer, suitable for `ort`'s `with_compute_stream`.
+    /// The handle (and therefore the stream) must outlive every session that
+    /// binds to it.
+    pub(crate) fn raw_stream_ptr(&self) -> *mut () {
+        self.stream.cu_stream().cast()
+    }
+}
+
+/// Fused GPU preprocess: holds the cudarc stream, compiled kernel, and
+/// persistent device input/scratch buffers.
+///
+/// Built in two phases at model load time: [`CudaStreamHandle::open`] runs
+/// *before* the ORT session is constructed (so the stream can be plumbed
+/// into the TRT/CUDA EPs), then [`Self::finalize`] runs *after* the session
+/// commit (so the model input edge length is known and the input buffer can
+/// be sized correctly). Per-frame work happens in [`Self::preprocess`].
+pub(crate) struct CudaPreprocessor {
+    /// Kept alive so the stream below outlives every session bound to it.
+    _ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    kernel: CudaFunction,
+
+    /// Persistent device buffer for the raw u8 source frame; grown on demand
+    /// when frame size changes between calls.
+    frame_dev: CudaSlice<u8>,
+    frame_dev_capacity: usize,
+    /// Pinned staging copy of the source frame, the same capacity as `frame_dev`, so the
+    /// upload runs as an async DMA the caller overlaps with host work. `None` on an
+    /// integrated GPU (DGX Spark, Jetson), where the pageable copy is already cheaper.
+    frame_host: Option<PinnedHostSlice<u8>>,
+    /// Recorded after each staged upload; `frame_host` is rewritten only once it completes.
+    uploaded: CudaEvent,
+
+    /// Persistent device buffer for the model input tensor
+    /// (`batch * 3 * dst_h * dst_w` f32). Pointer is stable for the buffer's
+    /// lifetime - cached so callers can hand it to ORT without re-querying.
+    input_dev: CudaSlice<f32>,
+    input_dev_ptr: u64,
+
+    /// Model input height/width (letterbox target). May be non-square.
+    dst_h: usize,
+    dst_w: usize,
+    /// Fill the input by stretching each axis instead of letterboxing, for RT-DETR.
+    stretch: bool,
+    /// Number of `3 * dst_h * dst_w` slots the input buffer holds.
+    batch: usize,
+    /// CUDA device the context, stream and buffers live on.
+    device_id: usize,
+}
+
+impl CudaPreprocessor {
+    /// Phase-2 init: NVRTC-compile the preprocess kernel and pre-allocate the
+    /// device input buffer (`batch * 3 * dst_h * dst_w` f32). Reuses the
+    /// context+stream from [`CudaStreamHandle::open`] so ORT and this
+    /// preprocessor share the same compute stream.
+    pub(crate) fn finalize(
+        handle: CudaStreamHandle,
+        dst_h: usize,
+        dst_w: usize,
+        batch: usize,
+        stretch: bool,
+    ) -> Result<Self> {
+        let CudaStreamHandle {
+            ctx,
+            stream,
+            device_id,
+        } = handle;
+
+        let ptx = compile_ptx_with_opts(KERNEL_SRC, cudarc::nvrtc::CompileOptions::default())
+            .map_err(|e| InferenceError::ModelLoadError(format!("NVRTC compile: {e:?}")))?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|e| InferenceError::ModelLoadError(format!("load_module: {e:?}")))?;
+        let kernel = module
+            .load_function("preprocess")
+            .map_err(|e| InferenceError::ModelLoadError(format!("load_function: {e:?}")))?;
+
+        let input_elems = batch * 3 * dst_h * dst_w;
+        let input_dev = stream
+            .alloc_zeros::<f32>(input_elems)
+            .map_err(|e| InferenceError::ModelLoadError(format!("alloc input_dev: {e:?}")))?;
+        let input_dev_ptr = {
+            let (p, _g) = input_dev.device_ptr(&stream);
+            p
+        };
+
+        let frame_dev = stream
+            .alloc_zeros::<u8>(1)
+            .map_err(|e| InferenceError::ModelLoadError(format!("alloc frame_dev: {e:?}")))?;
+        let load_err = |e: cudarc::driver::DriverError| {
+            InferenceError::ModelLoadError(format!("frame staging: {e:?}"))
+        };
+        let integrated = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            .map_err(load_err)?;
+        let frame_host = if integrated == 0 {
+            Some(unsafe { ctx.alloc_pinned::<u8>(1) }.map_err(load_err)?)
+        } else {
+            None
+        };
+        let uploaded = ctx.new_event(None).map_err(load_err)?;
+
+        Ok(Self {
+            _ctx: ctx,
+            stream,
+            kernel,
+            frame_dev,
+            frame_dev_capacity: 1,
+            frame_host,
+            uploaded,
+            input_dev,
+            input_dev_ptr,
+            dst_h,
+            dst_w,
+            stretch,
+            batch,
+            device_id,
+        })
+    }
+
+    /// Device pointer of the model input buffer (`batch * 3 * dst_h * dst_w` f32),
+    /// stable for the lifetime of this preprocessor.
+    pub(crate) const fn input_dev_ptr(&self) -> u64 {
+        self.input_dev_ptr
+    }
+
+    /// CUDA device the input buffer lives on. The `MemoryInfo` describing that buffer to
+    /// ONNX Runtime must name this device, not device 0, or a session running on another
+    /// GPU is handed a pointer it cannot read.
+    pub(crate) const fn device_id(&self) -> usize {
+        self.device_id
+    }
+
+    /// Whether uploads go through the pinned staging buffer, which only a discrete GPU uses.
+    pub(crate) const fn stages_upload(&self) -> bool {
+        self.frame_host.is_some()
+    }
+
+    /// Number of images the input buffer was sized for. A caller passing more than this
+    /// must not use the device path: the buffer cannot be grown without invalidating the
+    /// pointer already handed to ONNX Runtime.
+    pub(crate) const fn slots(&self) -> usize {
+        self.batch
+    }
+
+    /// Queue a copy from each device address into its host buffer, then wait once.
+    #[allow(unsafe_code)]
+    pub(crate) fn read_back<'a>(
+        &self,
+        outputs: impl IntoIterator<Item = (u64, &'a mut [f32])>,
+    ) -> Result<()> {
+        let err =
+            |e: cudarc::driver::DriverError| InferenceError::InferenceError(format!("dtoh: {e:?}"));
+        for (src, host) in outputs {
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async(host, src, self.stream.cu_stream())
+            }
+            .map_err(err)?;
+        }
+        self.stream.synchronize().map_err(err)
+    }
+
+    /// H2D-copy the source frame, launch the fused preprocess kernel writing
+    /// into the input buffer, and return the letterbox geometry needed by
+    /// post-processing.
+    ///
+    /// `dst` is the letterbox target `(height, width)`: the model input for square
+    /// inference, or the stride-aligned rectangle for `rect`. The caller sizes the buffer
+    /// at [`Self::finalize`] to the largest target `rect` can produce.
+    ///
+    /// `slot` selects which image of the batch to write, so a batched caller fills
+    /// `[N, 3, H, W]` in place and hands ORT the whole buffer with no host-side
+    /// concatenation.
+    ///
+    /// The output of this call is enqueued on the same stream that the ORT
+    /// session was bound to via [`CudaStreamHandle::raw_stream_ptr`], so the
+    /// subsequent `session.run_binding(...)` sees the writes without an
+    /// explicit synchronize.
+    pub(crate) fn preprocess(
+        &mut self,
+        frame_hwc: &[u8],
+        src_h: u32,
+        src_w: u32,
+        bgr_in: bool,
+        dst: (usize, usize),
+        slot: usize,
+    ) -> Result<PreGeom> {
+        let (dst_h, dst_w) = dst;
+        debug_assert!(
+            slot < self.batch,
+            "slot {slot} out of range for a {}-slot input buffer",
+            self.batch
+        );
+        // Writes are linear (`idx = y * dst_w + x`, plane stride `dst_h * dst_w`), so the
+        // product is what has to fit; the caller sizes the buffer to the largest target.
+        debug_assert!(
+            dst_h * dst_w <= self.dst_h * self.dst_w,
+            "letterbox target {dst_h}x{dst_w} exceeds the input buffer sized for {}x{}",
+            self.dst_h,
+            self.dst_w
+        );
+        let needed = (src_h as usize) * (src_w as usize) * 3;
+        if frame_hwc.len() != needed {
+            return Err(InferenceError::InferenceError(format!(
+                "frame buffer length {} != src_h * src_w * 3 = {needed}",
+                frame_hwc.len()
+            )));
+        }
+
+        let err =
+            |e: cudarc::driver::DriverError| InferenceError::InferenceError(format!("htod: {e:?}"));
+        // The previous upload may still be reading the staging buffer.
+        self.uploaded.synchronize().map_err(err)?;
+        if self.frame_dev_capacity < needed {
+            self.frame_dev = self.stream.alloc_zeros::<u8>(needed).map_err(err)?;
+            if let Some(host) = &mut self.frame_host {
+                *host = unsafe { self.stream.context().alloc_pinned::<u8>(needed) }.map_err(err)?;
+            }
+            self.frame_dev_capacity = needed;
+        }
+
+        if let Some(host) = &mut self.frame_host {
+            let host = &mut host.as_mut_slice().map_err(err)?[..needed];
+            host.copy_from_slice(frame_hwc);
+            let (frame_ptr, _record) = self.frame_dev.device_ptr(&self.stream);
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(frame_ptr, host, self.stream.cu_stream())
+            }
+            .map_err(err)?;
+            self.uploaded.record(&self.stream).map_err(err)?;
+        } else {
+            self.stream
+                .memcpy_htod(frame_hwc, &mut self.frame_dev)
+                .map_err(err)?;
+        }
+
+        // Geometry from the shared CPU helper, so the kernel and the CPU path can never
+        // disagree on scale/rounding/padding. `scale` is the `(y, x)` gain post-processing
+        // back-projects with.
+        let (geom, scale) = crate::preprocessing::LetterboxGeometry::compute(
+            src_w,
+            src_h,
+            (dst_h, dst_w),
+            self.stretch,
+        );
+        let (resized_w, resized_h) = (geom.new_w as i32, geom.new_h as i32);
+        let (pad_x, pad_y) = (geom.pad_left as i32, geom.pad_top as i32);
+        // Resampling ratios are src-per-dst on each axis, matching the CPU letterbox
+        // (`get_or_compute_x_lut(src_w, new_w)` / `scale_y = src_h / new_h`).
+        let scale_x = src_w as f32 / geom.new_w as f32;
+        let scale_y = src_h as f32 / geom.new_h as f32;
+        let bgr_in_i = i32::from(bgr_in);
+
+        let block_dim = (16u32, 16u32, 1u32);
+        let grid_dim = (
+            (dst_w as u32).div_ceil(block_dim.0),
+            (dst_h as u32).div_ceil(block_dim.1),
+            1u32,
+        );
+        let launch_cfg = LaunchConfig {
+            grid_dim,
+            block_dim,
+            shared_mem_bytes: 0,
+        };
+
+        // Write into this image's slot of the `[N, 3, H, W]` buffer. The kernel indexes
+        // from its `dst` base, so a sub-view is all the batching it needs.
+        //
+        // The stride is the *target* plane, not the backing buffer's. `finalize` rounds the
+        // buffer up to the stride, so a model input that is not stride-aligned (1000x1000
+        // backed by 1024x1024) would otherwise place image 1 after a 1024x1024 plane while
+        // ORT, reading the `[N, 3, dst_h, dst_w]` tensor, expects it after a 1000x1000 one.
+        let slot_elems = 3 * dst_h * dst_w;
+        let mut slot_view = self
+            .input_dev
+            .slice_mut(slot * slot_elems..(slot + 1) * slot_elems);
+
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernel)
+                .arg(&self.frame_dev)
+                .arg(&(src_h as i32))
+                .arg(&(src_w as i32))
+                .arg(&mut slot_view)
+                .arg(&(dst_h as i32))
+                .arg(&(dst_w as i32))
+                .arg(&scale_x)
+                .arg(&scale_y)
+                .arg(&resized_w)
+                .arg(&resized_h)
+                .arg(&pad_x)
+                .arg(&pad_y)
+                .arg(&bgr_in_i)
+                .launch(launch_cfg)
+                .map_err(|e| InferenceError::InferenceError(format!("kernel launch: {e:?}")))?;
+        }
+
+        Ok(PreGeom {
+            scale,
+            pad_x,
+            pad_y,
+        })
+    }
+}
+
+impl Drop for CudaPreprocessor {
+    fn drop(&mut self) {
+        // `PinnedHostSlice` frees without waiting for the raw async upload that reads it.
+        let _ = self.uploaded.synchronize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Runs only on an NVIDIA GPU: the whole module is `cuda-preprocess`-gated,
+    // so these compile and execute exclusively on the GPU CI runner. Inline
+    // tests reach the preprocessor's private `stream`/`input_dev` fields to copy
+    // the kernel output back to the host and assert on it.
+    use super::*;
+
+    /// Padded background emitted by the kernel (`114/255`).
+    const PAD: f32 = 114.0 / 255.0;
+    /// Tolerance for GPU-computed float comparisons.
+    const EPS: f32 = 1e-4;
+
+    /// Open device 0 and build a letterboxing preprocessor targeting `dst_h` x `dst_w`.
+    fn preprocessor(dst_h: usize, dst_w: usize) -> CudaPreprocessor {
+        preprocessor_with(dst_h, dst_w, false)
+    }
+
+    /// Open device 0 and build a preprocessor targeting `dst_h` x `dst_w`, scale-filling
+    /// the target when `stretch` is set.
+    fn preprocessor_with(dst_h: usize, dst_w: usize, stretch: bool) -> CudaPreprocessor {
+        let handle = CudaStreamHandle::open(0).expect("open CUDA device 0");
+        CudaPreprocessor::finalize(handle, dst_h, dst_w, 1, stretch).expect("finalize preprocessor")
+    }
+
+    /// Build an HWC RGB buffer filled with a single solid color.
+    fn solid(height: usize, width: usize, red: u8, green: u8, blue: u8) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(height * width * 3);
+        for _ in 0..height * width {
+            buf.extend_from_slice(&[red, green, blue]);
+        }
+        buf
+    }
+
+    /// Copy the device input buffer back to the host as flat CHW f32 planes.
+    fn readback(pre: &CudaPreprocessor) -> Vec<f32> {
+        pre.stream
+            .clone_dtoh(&pre.input_dev)
+            .expect("device to host copy")
+    }
+
+    #[test]
+    fn stream_handle_open() {
+        let handle = CudaStreamHandle::open(0).expect("open CUDA device 0");
+        // This pointer is what `with_compute_stream` hands ORT. A null one (which is what
+        // `default_stream()` would give) reads as "no stream supplied", so ORT runs the
+        // session on its own stream and the preprocess kernels stop being ordered against
+        // inference. Assert it is real, or that regression passes unnoticed.
+        assert!(
+            !handle.raw_stream_ptr().is_null(),
+            "the preprocess stream must be a real stream, not CUDA's null default"
+        );
+    }
+
+    #[test]
+    fn preprocessor_finalize_allocates() {
+        let pre = preprocessor(640, 640);
+        assert_eq!((pre.dst_h, pre.dst_w), (640, 640));
+        assert_ne!(
+            pre.input_dev_ptr(),
+            0,
+            "device input buffer must be allocated"
+        );
+    }
+
+    #[test]
+    fn preprocess_square_geometry() {
+        let mut pre = preprocessor(640, 640);
+        let (src_h, src_w) = (480u32, 640u32);
+        let frame = solid(src_h as usize, src_w as usize, 200, 100, 50);
+
+        let geom = pre
+            .preprocess(&frame, src_h, src_w, false, (pre.dst_h, pre.dst_w), 0)
+            .expect("preprocess");
+
+        // 640/640 = 1.0 is the binding axis; the 480-tall image is centered.
+        assert!(
+            (geom.scale.0 - 1.0).abs() < EPS && (geom.scale.1 - 1.0).abs() < EPS,
+            "scale = {:?}",
+            geom.scale
+        );
+        assert_eq!(geom.pad_x, 0);
+        assert_eq!(geom.pad_y, 80);
+
+        let host = readback(&pre);
+        assert!(
+            host.iter().all(|&v| (0.0..=1.0).contains(&v)),
+            "every output value must be normalized into [0, 1]"
+        );
+    }
+
+    #[test]
+    fn preprocess_non_square_target() {
+        let mut pre = preprocessor(384, 640);
+        assert_eq!((pre.dst_h, pre.dst_w), (384, 640));
+
+        // 640x640 into 384x640: scale 0.6 fills the width, pads the height to 0.
+        let frame = solid(640, 640, 10, 20, 30);
+        let geom = pre
+            .preprocess(&frame, 640, 640, false, (pre.dst_h, pre.dst_w), 0)
+            .expect("preprocess");
+
+        assert_eq!(geom.pad_y, 0);
+        assert!(
+            geom.pad_x > 0,
+            "expected horizontal padding, got {}",
+            geom.pad_x
+        );
+    }
+
+    #[test]
+    fn preprocess_stretch_fills_target() {
+        // RT-DETR scale-fill: a 480x640 source covers the whole 640x640 target, so there
+        // is no padding and each axis reports its own gain.
+        let mut pre = preprocessor_with(640, 640, true);
+        let frame = solid(480, 640, 200, 100, 50);
+
+        let geom = pre
+            .preprocess(&frame, 480, 640, false, (pre.dst_h, pre.dst_w), 0)
+            .expect("preprocess");
+
+        assert_eq!((geom.pad_x, geom.pad_y), (0, 0));
+        assert!(
+            (geom.scale.0 - 640.0 / 480.0).abs() < EPS && (geom.scale.1 - 1.0).abs() < EPS,
+            "scale = {:?}",
+            geom.scale
+        );
+
+        // No padding means no pixel keeps the letterbox fill value.
+        let host = readback(&pre);
+        assert!(
+            host.iter().all(|&v| (v - PAD).abs() > EPS),
+            "a scale-filled tensor must not contain letterbox padding"
+        );
+    }
+
+    #[test]
+    fn preprocess_padding_value() {
+        let (dst, src_h, src_w) = (128usize, 64u32, 32u32);
+        let mut pre = preprocessor(dst, dst);
+        let frame = solid(src_h as usize, src_w as usize, 255, 255, 255);
+
+        let geom = pre
+            .preprocess(&frame, src_h, src_w, false, (pre.dst_h, pre.dst_w), 0)
+            .expect("preprocess");
+        assert!(
+            geom.pad_x > 0,
+            "expected horizontal padding, got {}",
+            geom.pad_x
+        );
+
+        // The top-left pixel is outside the resized image, so it is background.
+        let host = readback(&pre);
+        let hw = dst * dst;
+        for plane in 0..3 {
+            let v = host[plane * hw];
+            assert!(
+                (v - PAD).abs() < EPS,
+                "padding plane {plane} = {v}, want {PAD}"
+            );
+        }
+    }
+
+    #[test]
+    fn preprocess_center_normalize() {
+        let dst = 64usize;
+        let mut pre = preprocessor(dst, dst);
+        // Square input, no letterbox: every pixel is R=255, G=0, B=0.
+        let frame = solid(dst, dst, 255, 0, 0);
+        pre.preprocess(
+            &frame,
+            dst as u32,
+            dst as u32,
+            false,
+            (pre.dst_h, pre.dst_w),
+            0,
+        )
+        .expect("preprocess");
+
+        let host = readback(&pre);
+        let hw = dst * dst;
+        let idx = (dst / 2) * dst + dst / 2;
+        assert!((host[idx] - 1.0).abs() < EPS, "R plane = {}", host[idx]);
+        assert!(host[hw + idx].abs() < EPS, "G plane = {}", host[hw + idx]);
+        assert!(
+            host[2 * hw + idx].abs() < EPS,
+            "B plane = {}",
+            host[2 * hw + idx]
+        );
+    }
+
+    #[test]
+    fn preprocess_bgr_swap() {
+        let dst = 64usize;
+        let frame = solid(dst, dst, 255, 0, 0); // byte order [255, 0, 0]
+        let hw = dst * dst;
+        let idx = (dst / 2) * dst + dst / 2;
+
+        let mut rgb = preprocessor(dst, dst);
+        rgb.preprocess(
+            &frame,
+            dst as u32,
+            dst as u32,
+            false,
+            (rgb.dst_h, rgb.dst_w),
+            0,
+        )
+        .expect("rgb preprocess");
+        let rgb_host = readback(&rgb);
+
+        let mut bgr = preprocessor(dst, dst);
+        bgr.preprocess(
+            &frame,
+            dst as u32,
+            dst as u32,
+            true,
+            (bgr.dst_h, bgr.dst_w),
+            0,
+        )
+        .expect("bgr preprocess");
+        let bgr_host = readback(&bgr);
+
+        // RGB reads byte[0]=255 into R; BGR reads the same byte into B.
+        assert!(
+            (rgb_host[idx] - 1.0).abs() < EPS,
+            "rgb R = {}",
+            rgb_host[idx]
+        );
+        assert!(bgr_host[idx].abs() < EPS, "bgr R = {}", bgr_host[idx]);
+        assert!(
+            (bgr_host[2 * hw + idx] - 1.0).abs() < EPS,
+            "bgr B = {}",
+            bgr_host[2 * hw + idx]
+        );
+    }
+
+    #[test]
+    fn preprocess_rejects_wrong_len() {
+        let mut pre = preprocessor(64, 64);
+        let bad = vec![0u8; 10]; // != 64 * 64 * 3
+        let result = pre.preprocess(&bad, 64, 64, false, (pre.dst_h, pre.dst_w), 0);
+        assert!(
+            matches!(result, Err(InferenceError::InferenceError(_))),
+            "wrong-length frame must be rejected"
+        );
+    }
+
+    #[test]
+    fn preprocess_frame_buffer_growth() {
+        let mut pre = preprocessor(128, 128);
+        // First a small frame, then a larger one to force `frame_dev` to grow.
+        let small = solid(32, 32, 1, 2, 3);
+        pre.preprocess(&small, 32, 32, false, (pre.dst_h, pre.dst_w), 0)
+            .expect("small frame");
+        let large = solid(256, 256, 4, 5, 6);
+        pre.preprocess(&large, 256, 256, false, (pre.dst_h, pre.dst_w), 0)
+            .expect("large frame after buffer growth");
+    }
+
+    #[test]
+    fn preprocess_matches_cpu_letterbox() {
+        // The GPU kernel and the CPU letterbox must produce the same tensor, otherwise
+        // `--device cuda` silently infers on different pixels than `--device cpu`. A
+        // gradient (not a solid color) is required: a flat image hides both the
+        // half-pixel offset and the per-axis resampling ratio.
+        //
+        // Both source shapes letterbox into the same rect target, but 271x481 rounds the
+        // padded axis (`round(271 * scale) != 271 * scale`) while 270x480 divides exactly.
+        // Only the rounding case distinguishes the CPU's `src / resized` ratio from a
+        // uniform `1 / letterbox-scale`, so it must stay in the list.
+        for (src_h, src_w) in [(271usize, 481usize), (270, 480), (481, 271)] {
+            let mut frame = Vec::with_capacity(src_h * src_w * 3);
+            for y in 0..src_h {
+                for x in 0..src_w {
+                    frame.extend_from_slice(&[
+                        (x % 256) as u8,
+                        (y % 256) as u8,
+                        ((x + y) % 256) as u8,
+                    ]);
+                }
+            }
+
+            // A rect target, so this also covers the non-square letterbox `rect` produces.
+            let dst = (192usize, 320usize);
+            let mut pre = preprocessor(dst.0, dst.1);
+            pre.preprocess(&frame, src_h as u32, src_w as u32, false, dst, 0)
+                .expect("gpu preprocess");
+            let gpu = readback(&pre);
+
+            let img = image::DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(src_w as u32, src_h as u32, frame).expect("rgb image"),
+            );
+            let cpu = crate::preprocessing::preprocess_image_with_precision(&img, dst, 32, None);
+            let cpu = cpu.tensor.as_slice().expect("contiguous cpu tensor");
+
+            let n = 3 * dst.0 * dst.1;
+            let max_diff = (0..n).fold(0.0f32, |m, i| m.max((gpu[i] - cpu[i]).abs()));
+            // 1/255 == 0.0039: anything above one input quantization step is a real
+            // resampling mismatch, not float noise (the CPU uses OpenCV's 11-bit
+            // fixed-point weights, the kernel f32).
+            assert!(
+                max_diff < 1.0 / 255.0,
+                "gpu letterbox deviates from cpu by {max_diff} at {src_h}x{src_w}"
+            );
+        }
+    }
+}

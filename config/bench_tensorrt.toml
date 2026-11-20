@@ -1,0 +1,24 @@
+# 工程基准（TensorRT FP32，batch=1）。
+# 用法: cargo run --release --features "cuda tensorrt" -- bench config/bench_tensorrt.toml
+# 输出: results/bench_report.json（与 bench_tensorrt_fp16.toml 对比量化加速比）
+# 注意: 首次运行会构建 TensorRT 引擎（640x640 约 30s~1min），缓存在 model 同目录 .trt_cache/。
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[source]
+type = "directory"
+path = "data/bench"
+
+[inference]
+device = "tensorrt:0"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[bench]
+warmup = 3
+iterations = 20
+dir = "results/bench_tensorrt"

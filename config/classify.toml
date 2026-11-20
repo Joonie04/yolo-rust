@@ -1,0 +1,21 @@
+# 图像分类示例
+# 用法: cargo run -- config/classify.toml
+
+[model]
+path = "models/cls/yolo26n-cls.onnx"
+
+[source]
+type = "image"
+path = "data/bus.jpg"
+
+[inference]
+device = "cpu"
+threads = 0
+
+[output]
+save_annotated = true
+save_json = true
+dir = "results"
+
+[logging]
+verbose = true

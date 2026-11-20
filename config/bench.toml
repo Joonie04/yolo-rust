@@ -1,0 +1,26 @@
+# 工程基准：测量延迟百分位（p50/p95/p99）、吞吐（图/s）、峰值内存（RSS）。
+# 用法: cargo run -- bench config/bench.toml
+# 输出: results/bench_report.json
+#
+# 对比 batch=1 vs batch=N 吞吐：把本文件 source 指向一个目录，设 inference.batch = N，
+# 再跑一次，对比两份 bench_report.json 的 throughput.images_per_sec。
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[source]
+type = "directory"
+path = "data"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[bench]
+warmup = 3
+iterations = 20
+dir = "results"

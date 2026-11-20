@@ -1,0 +1,22 @@
+# 工程基准（CUDA GPU，yolo26m 中模型，batch=1）。
+# 用法: cargo run --release --features cuda -- bench config/bench_cuda_m.toml
+
+[model]
+path = "models/det/yolo26m.onnx"
+
+[source]
+type = "directory"
+path = "data/bench"
+
+[inference]
+device = "cuda:0"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[bench]
+warmup = 3
+iterations = 20
+dir = "results/bench_cuda_m"

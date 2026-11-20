@@ -1,0 +1,27 @@
+[package]
+name = "yolo-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "基于 ultralytics-inference 的配置驱动 YOLO 推理项目"
+
+[dependencies]
+ultralytics-inference = { path = "vendor/inference", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+thiserror = "2"
+image = "0.25"
+sysinfo = "0.33"
+
+# 透传底层库的 feature，按需开启 GPU / 视频等能力。
+[features]
+default = ["annotate"]
+annotate  = ["ultralytics-inference/annotate"]
+visualize = ["ultralytics-inference/visualize"]
+video     = ["ultralytics-inference/video"]
+cuda      = ["ultralytics-inference/cuda"]
+tensorrt  = ["ultralytics-inference/tensorrt"]
+directml  = ["ultralytics-inference/directml"]
+openvino  = ["ultralytics-inference/openvino"]
+coreml    = ["ultralytics-inference/coreml"]

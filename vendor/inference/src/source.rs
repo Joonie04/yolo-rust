@@ -1,0 +1,1084 @@
+// Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+//! Input source handling for YOLO inference.
+//!
+//! This module provides abstractions for various input sources including
+//! images, videos, webcams, and streaming URLs.
+
+use std::path::{Path, PathBuf};
+
+use image::DynamicImage;
+use ndarray::Array3;
+
+use crate::error::{InferenceError, Result};
+
+/// Represents different input sources for inference.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// Path to an image file.
+    Image(PathBuf),
+    /// In-memory image.
+    ImageBuffer(DynamicImage),
+    /// Raw HWC u8 array.
+    Array(Array3<u8>),
+    /// HTTP/HTTPS URL to an image file.
+    ImageUrl(String),
+    /// List of image paths.
+    ImageList(Vec<PathBuf>),
+    /// Path to a video file.
+    Video(PathBuf),
+    /// Webcam device index.
+    Webcam(u32),
+    /// Streaming URL (RTSP, RTMP, HTTP).
+    Stream(String),
+    /// Directory containing images.
+    Directory(PathBuf),
+    /// Glob pattern for images.
+    Glob(String),
+}
+
+impl Source {
+    /// Check if this source is a single image.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the source is an image type (file, buffer, array, URL).
+    #[must_use]
+    pub const fn is_image(&self) -> bool {
+        matches!(
+            self,
+            Self::Image(_) | Self::ImageBuffer(_) | Self::Array(_) | Self::ImageUrl(_)
+        )
+    }
+
+    /// Check if this source is a video or stream.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the source is a video type (file, webcam, stream).
+    #[must_use]
+    pub const fn is_video(&self) -> bool {
+        matches!(self, Self::Video(_) | Self::Webcam(_) | Self::Stream(_))
+    }
+
+    /// Check if this source is a directory or glob pattern.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the source represents a batch of images.
+    #[must_use]
+    pub const fn is_batch(&self) -> bool {
+        matches!(
+            self,
+            Self::Directory(_) | Self::Glob(_) | Self::ImageList(_)
+        )
+    }
+
+    /// Get the path if this source has one.
+    ///
+    /// # Returns
+    ///
+    /// * `Some` path reference if applicable, otherwise `None`.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Image(p) | Self::Video(p) | Self::Directory(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Check if a URL points to an image based on extension.
+    fn is_image_url(url: &str) -> bool {
+        let url_lower = url.to_lowercase();
+        // Remove query parameters if present
+        let path_part = url_lower.split('?').next().unwrap_or(&url_lower);
+
+        std::path::Path::new(path_part)
+            .extension()
+            .is_some_and(|ext| {
+                let s = ext.to_string_lossy();
+                s.eq_ignore_ascii_case("jpg")
+                    || s.eq_ignore_ascii_case("jpeg")
+                    || s.eq_ignore_ascii_case("png")
+                    || s.eq_ignore_ascii_case("bmp")
+                    || s.eq_ignore_ascii_case("gif")
+                    || s.eq_ignore_ascii_case("webp")
+                    || s.eq_ignore_ascii_case("tiff")
+                    || s.eq_ignore_ascii_case("tif")
+            })
+    }
+}
+
+/// Convert from a string path to Source.
+impl From<&str> for Source {
+    fn from(s: &str) -> Self {
+        // Check for webcam index
+        if let Ok(idx) = s.parse::<u32>() {
+            return Self::Webcam(idx);
+        }
+
+        // Check for HTTP/HTTPS URLs
+        if s.starts_with("http://") || s.starts_with("https://") {
+            // Check if it's an image URL by extension
+            if Self::is_image_url(s) {
+                return Self::ImageUrl(s.to_string());
+            }
+            // Otherwise treat as video stream
+            return Self::Stream(s.to_string());
+        }
+
+        // Check for streaming URLs
+        if s.starts_with("rtsp://") || s.starts_with("rtmp://") {
+            return Self::Stream(s.to_string());
+        }
+
+        // Check for glob pattern
+        if s.contains('*') {
+            return Self::Glob(s.to_string());
+        }
+
+        let path = PathBuf::from(s)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(s));
+
+        // Check if it's a directory
+        if path.is_dir() {
+            return Self::Directory(path);
+        }
+
+        // Check file extension for video
+        if let Some(ext) = path.extension() {
+            let ext = ext.to_string_lossy().to_lowercase();
+            if matches!(
+                ext.as_str(),
+                "mp4" | "avi" | "mov" | "mkv" | "wmv" | "flv" | "webm" | "m4v" | "mpeg" | "mpg"
+            ) {
+                return Self::Video(path);
+            }
+        }
+
+        // Default to image
+        Self::Image(path)
+    }
+}
+
+impl From<String> for Source {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
+impl From<PathBuf> for Source {
+    fn from(path: PathBuf) -> Self {
+        Self::from(path.to_string_lossy().as_ref())
+    }
+}
+
+impl From<&Path> for Source {
+    fn from(path: &Path) -> Self {
+        Self::from(path.to_string_lossy().as_ref())
+    }
+}
+
+impl From<DynamicImage> for Source {
+    fn from(img: DynamicImage) -> Self {
+        Self::ImageBuffer(img)
+    }
+}
+
+impl From<Array3<u8>> for Source {
+    fn from(arr: Array3<u8>) -> Self {
+        Self::Array(arr)
+    }
+}
+
+impl From<u32> for Source {
+    fn from(idx: u32) -> Self {
+        Self::Webcam(idx)
+    }
+}
+
+impl From<i32> for Source {
+    fn from(idx: i32) -> Self {
+        #[allow(clippy::cast_sign_loss)]
+        Self::Webcam(idx as u32)
+    }
+}
+
+/// Metadata about a source frame.
+#[derive(Debug, Clone)]
+pub struct SourceMeta {
+    /// Frame index (0 for single images).
+    pub frame_idx: usize,
+    /// Total frames (1 for single images, may be unknown for streams).
+    pub total_frames: Option<usize>,
+    /// Source path or identifier.
+    pub path: String,
+    /// Frames per second (for video sources).
+    pub fps: Option<f32>,
+}
+
+impl Default for SourceMeta {
+    fn default() -> Self {
+        Self {
+            frame_idx: 0,
+            total_frames: Some(1),
+            path: String::new(),
+            fps: None,
+        }
+    }
+}
+
+#[cfg(feature = "video")]
+use ffmpeg_next as ffmpeg;
+
+/// Cached `RGB24` colorspace conversion: the scaler context and the output frame it writes.
+#[cfg(feature = "video")]
+type RgbScaler = (
+    ffmpeg::software::scaling::context::Context,
+    ffmpeg::util::frame::video::Video,
+);
+
+/// Convert a decoded video frame to a tightly-packed RGB24 [`DynamicImage`] using a BILINEAR
+/// scaler. `scaler` caches the context and its output frame and is rebuilt when the frame's
+/// format or size changes, so pass a persistent `Option` to reuse them across frames.
+#[cfg(feature = "video")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn frame_to_rgb_image(
+    scaler: &mut Option<RgbScaler>,
+    decoded: &ffmpeg::util::frame::video::Video,
+) -> Result<DynamicImage> {
+    // Drop a cached context whose source properties no longer match: a webcam can
+    // renegotiate format or resolution mid-capture.
+    let reusable = scaler.take().filter(|(s, _)| {
+        let i = s.input();
+        i.format == decoded.format() && i.width == decoded.width() && i.height == decoded.height()
+    });
+    let cached = match reusable {
+        Some(cached) => cached,
+        None => (
+            ffmpeg::software::scaling::context::Context::get(
+                decoded.format(),
+                decoded.width(),
+                decoded.height(),
+                ffmpeg::format::Pixel::RGB24,
+                decoded.width(),
+                decoded.height(),
+                ffmpeg::software::scaling::flag::Flags::BILINEAR,
+            )
+            .map_err(|e| InferenceError::VideoError(format!("Scaler init: {e}")))?,
+            ffmpeg::util::frame::video::Video::empty(),
+        ),
+    };
+
+    let (context, rgb_frame) = scaler.insert(cached);
+    context
+        .run(decoded, rgb_frame)
+        .map_err(|e| InferenceError::VideoError(format!("Scale: {e}")))?;
+
+    let width = rgb_frame.width();
+    let height = rgb_frame.height();
+    let data = rgb_frame.data(0);
+    let stride = rgb_frame.stride(0);
+
+    // Copy tightly-packed RGB data (stride may be wider than width*3).
+    let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height as usize {
+        let row = &data[y * stride..y * stride + (width as usize) * 3];
+        rgb_data.extend_from_slice(row);
+    }
+
+    let img_buffer = image::RgbImage::from_raw(width, height, rgb_data).ok_or_else(|| {
+        InferenceError::ImageError("Failed to create image from video frame".into())
+    })?;
+    Ok(DynamicImage::ImageRgb8(img_buffer))
+}
+
+/// Custom `FFmpeg` video decoder using `SWS_BILINEAR` for YUV -> RGB conversion.
+///
+/// Other scaler choices such as `SWS_AREA` produce slightly different pixel values
+/// during colorspace conversion. Those differences can affect borderline confidence
+/// predictions and lead to small detection drift, so `SWS_BILINEAR` is explicit here.
+#[cfg(feature = "video")]
+struct BilinearVideoDecoder {
+    input_ctx: ffmpeg::format::context::Input,
+    decoder: ffmpeg::decoder::Video,
+    scaler: Option<RgbScaler>,
+    stream_index: usize,
+    /// Total frames (estimated from duration * fps).
+    total_frames: Option<usize>,
+    /// Frames per second.
+    fps: f32,
+}
+
+#[cfg(feature = "video")]
+impl BilinearVideoDecoder {
+    /// Open `path` with `FFmpeg` and set up the decoder and bilinear `RGB24` scaler.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn new(path: &Path) -> Result<Self> {
+        ffmpeg::init().map_err(|e| InferenceError::VideoError(format!("FFmpeg init: {e}")))?;
+
+        let input_ctx = ffmpeg::format::input(path).map_err(|e| {
+            InferenceError::VideoError(format!("Cannot open {}: {e}", path.display()))
+        })?;
+
+        let stream = input_ctx
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .ok_or_else(|| InferenceError::VideoError("No video stream found".into()))?;
+
+        let stream_index = stream.index();
+
+        // Estimate total frames
+        #[allow(clippy::cast_possible_truncation)]
+        let fps = f64::from(stream.avg_frame_rate()) as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let duration_secs = input_ctx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let total_frames = if duration_secs > 0.0 && fps > 0.0 {
+            Some((duration_secs * f64::from(fps)) as usize)
+        } else {
+            None
+        };
+
+        let context_decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| InferenceError::VideoError(format!("Codec context: {e}")))?;
+        // libavcodec decodes on one thread unless asked; `threads=auto` sizes the pool to the
+        // CPU count and keeps its default frame+slice threading, with identical output.
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("threads", "auto");
+        let context_decoder = context_decoder.decoder();
+        let codec = ffmpeg::decoder::find(context_decoder.id())
+            .ok_or_else(|| InferenceError::VideoError("Video decoder not found".into()))?;
+        let decoder = context_decoder
+            .open_as_with(codec, options)
+            .and_then(ffmpeg::decoder::Opened::video)
+            .map_err(|e| InferenceError::VideoError(format!("Video decoder: {e}")))?;
+
+        Ok(Self {
+            input_ctx,
+            decoder,
+            scaler: None,
+            stream_index,
+            total_frames,
+            fps,
+        })
+    }
+
+    /// Decode the next frame as an RGB24 `DynamicImage`.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn decode_next(&mut self) -> Option<Result<DynamicImage>> {
+        let mut decoded = ffmpeg::util::frame::video::Video::empty();
+
+        loop {
+            // Try to receive a frame from the decoder first
+            if self.decoder.receive_frame(&mut decoded).is_ok() {
+                return Some(frame_to_rgb_image(&mut self.scaler, &decoded));
+            }
+
+            // Read packets until we find one for our stream
+            let mut found_packet = false;
+            for (stream, packet) in self.input_ctx.packets() {
+                if stream.index() == self.stream_index {
+                    if self.decoder.send_packet(&packet).is_err() {
+                        continue;
+                    }
+                    found_packet = true;
+                    break;
+                }
+            }
+
+            if !found_packet {
+                // End of stream - flush decoder
+                let _ = self.decoder.send_eof();
+                return if self.decoder.receive_frame(&mut decoded).is_ok() {
+                    Some(frame_to_rgb_image(&mut self.scaler, &decoded))
+                } else {
+                    None
+                };
+            }
+
+            // Try to receive again after sending the packet
+            if self.decoder.receive_frame(&mut decoded).is_ok() {
+                return Some(frame_to_rgb_image(&mut self.scaler, &decoded));
+            }
+        }
+    }
+}
+
+/// Iterator over frames from a source.
+pub struct SourceIterator {
+    source: Source,
+    current_frame: usize,
+    image_paths: Vec<PathBuf>,
+    #[cfg(feature = "video")]
+    decoder: Option<BilinearVideoDecoder>,
+    #[cfg(feature = "video")]
+    webcam_decoder: Option<(ffmpeg::format::context::Input, ffmpeg::decoder::Video)>,
+    /// Colorspace context reused across webcam frames, as the video path does.
+    #[cfg(feature = "video")]
+    webcam_scaler: Option<RgbScaler>,
+    #[cfg(feature = "video")]
+    webcam_stream_index: usize,
+    #[cfg(feature = "video")]
+    total_frames: Option<usize>,
+    #[cfg(feature = "video")]
+    webcam_init_failed: bool,
+    #[cfg(feature = "video")]
+    video_init_failed: bool,
+}
+
+impl SourceIterator {
+    /// Create a new source iterator.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The input source to iterate over.
+    ///
+    /// # Returns
+    ///
+    /// * A new `SourceIterator` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source cannot be opened (e.g. directory not found).
+    pub fn new(source: Source) -> Result<Self> {
+        let image_paths = match &source {
+            Source::Directory(path) => Self::collect_images_from_dir(path)?,
+            Source::Glob(pattern) => Self::collect_images_from_glob(pattern)?,
+            Source::Image(path) => vec![path.clone()],
+            // URLs are handled separately via next_image_url
+            Source::ImageList(paths) => paths.clone(),
+            _ => vec![],
+        };
+
+        Ok(Self {
+            source,
+            current_frame: 0,
+            image_paths,
+            #[cfg(feature = "video")]
+            decoder: None,
+            #[cfg(feature = "video")]
+            webcam_decoder: None,
+            #[cfg(feature = "video")]
+            webcam_scaler: None,
+            #[cfg(feature = "video")]
+            webcam_stream_index: 0,
+            #[cfg(feature = "video")]
+            total_frames: None,
+            #[cfg(feature = "video")]
+            webcam_init_failed: false,
+            #[cfg(feature = "video")]
+            video_init_failed: false,
+        })
+    }
+
+    /// Collect image paths from a directory.
+    fn collect_images_from_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+        if !dir.is_dir() {
+            return Err(InferenceError::ImageError(format!(
+                "Not a directory: {}",
+                dir.display()
+            )));
+        }
+
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| Self::is_image_file(path))
+            .collect();
+
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// Collect image paths from a glob pattern.
+    ///
+    /// Note: This is a simplified glob implementation that only supports patterns like "dir/*.jpg"
+    /// For more complex glob patterns, consider adding the `glob` crate.
+    fn collect_images_from_glob(pattern: &str) -> Result<Vec<PathBuf>> {
+        // Simple glob: split into directory and extension pattern
+        // Supports patterns like "images/*.jpg" or "path/to/dir/*.png"
+        if let Some(star_pos) = pattern.find('*') {
+            let dir_part = &pattern[..star_pos];
+            let dir = if dir_part.is_empty() {
+                Path::new(".")
+            } else {
+                Path::new(dir_part.trim_end_matches('/').trim_end_matches('\\'))
+            };
+
+            // Get extension filter from pattern (e.g., "*.jpg" -> "jpg")
+            let ext_filter: Option<String> = pattern[star_pos..]
+                .strip_prefix("*.")
+                .map(str::to_lowercase);
+
+            if !dir.is_dir() {
+                return Err(InferenceError::ImageError(format!(
+                    "Directory not found: {}",
+                    dir.display()
+                )));
+            }
+
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    ext_filter.as_ref().map_or_else(
+                        || Self::is_image_file(path),
+                        |ext| {
+                            path.extension()
+                                .is_some_and(|e| e.to_string_lossy().to_lowercase() == *ext)
+                        },
+                    )
+                })
+                .collect();
+
+            paths.sort();
+            Ok(paths)
+        } else {
+            // No glob pattern, treat as single file
+            Ok(vec![PathBuf::from(pattern)])
+        }
+    }
+
+    /// Check if a path is an image file based on extension.
+    fn is_image_file(path: &Path) -> bool {
+        path.extension().is_some_and(|ext| {
+            let ext = ext.to_string_lossy().to_lowercase();
+            matches!(
+                ext.as_str(),
+                "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "tif"
+            )
+        })
+    }
+
+    /// Download an image from a URL.
+    fn download_image(url: &str) -> Result<DynamicImage> {
+        let mut response = ureq::get(url)
+            .call()
+            .map_err(|e| InferenceError::ImageError(format!("Failed to download {url}: {e}")))?
+            .into_body();
+
+        let bytes = response.read_to_vec().map_err(|e| {
+            InferenceError::ImageError(format!("Failed to read response from {url}: {e}"))
+        })?;
+
+        image::load_from_memory(&bytes).map_err(|e| {
+            InferenceError::ImageError(format!("Failed to decode image from {url}: {e}"))
+        })
+    }
+
+    /// Get the next image from a URL.
+    fn next_image_url(&mut self, url: &str) -> Option<Result<(DynamicImage, SourceMeta)>> {
+        if self.current_frame > 0 {
+            return None;
+        }
+
+        self.current_frame = 1;
+        let meta = SourceMeta {
+            frame_idx: 0,
+            total_frames: Some(1),
+            path: url.to_string(),
+            fps: None,
+        };
+
+        match Self::download_image(url) {
+            Ok(img) => Some(Ok((img, meta))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Get the next image from the source.
+    fn next_image(&mut self) -> Option<Result<(DynamicImage, SourceMeta)>> {
+        if self.current_frame >= self.image_paths.len() {
+            return None;
+        }
+
+        let path = &self.image_paths[self.current_frame];
+        let meta = SourceMeta {
+            frame_idx: self.current_frame,
+            total_frames: Some(self.image_paths.len()),
+            path: path.to_string_lossy().to_string(),
+            fps: None,
+        };
+
+        self.current_frame += 1;
+
+        match image::open(path) {
+            Ok(img) => Some(Ok((img, meta))),
+            Err(e) => Some(Err(InferenceError::ImageError(format!(
+                "Failed to load {}: {e}",
+                path.display()
+            )))),
+        }
+    }
+
+    /// Open webcam `idx` and store its decoder, using the platform's capture backend.
+    ///
+    /// Failures are returned; the caller records them once via `webcam_init_failed`.
+    #[cfg(feature = "video")]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[allow(unsafe_code)]
+    fn open_webcam(&mut self, idx: u32) -> Result<()> {
+        ffmpeg::init().ok();
+
+        let (format_name, device_name) = if cfg!(target_os = "macos") {
+            ("avfoundation", idx.to_string()) // avfoundation takes the bare index
+        } else if cfg!(target_os = "linux") {
+            ("video4linux2", format!("/dev/video{idx}"))
+        } else if cfg!(target_os = "windows") {
+            ("dshow", format!("video={idx}"))
+        } else {
+            return Err(InferenceError::VideoError(
+                "Unsupported OS for webcam".to_string(),
+            ));
+        };
+
+        // The format lookup has no safe wrapper.
+        let c_name = std::ffi::CString::new(format_name).map_err(|_| {
+            InferenceError::VideoError(format!("Invalid input format name '{format_name}'"))
+        })?;
+        let ptr = unsafe { ffmpeg::ffi::av_find_input_format(c_name.as_ptr()) };
+        if ptr.is_null() {
+            return Err(InferenceError::VideoError(format!(
+                "Input format '{format_name}' not found"
+            )));
+        }
+        #[allow(clippy::ptr_cast_constness)]
+        let input_format = unsafe { ffmpeg::format::Input::wrap(ptr.cast_mut()) };
+
+        // Explicit framerate avoids a default NTSC mismatch.
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("framerate", "30");
+
+        let opened = ffmpeg::format::open_with(
+            &PathBuf::from(&device_name),
+            &ffmpeg::Format::Input(input_format),
+            options,
+        )
+        .map_err(|e| InferenceError::VideoError(format!("Failed to open webcam: {e}")))?;
+
+        let ffmpeg::format::context::Context::Input(ictx) = opened else {
+            return Err(InferenceError::VideoError(
+                "Opened context is not an input context".to_string(),
+            ));
+        };
+
+        let stream = ictx
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .ok_or_else(|| {
+                InferenceError::VideoError("No video stream found in webcam".to_string())
+            })?;
+        self.webcam_stream_index = stream.index();
+
+        let mut decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| {
+                InferenceError::VideoError(format!("Failed to read webcam stream parameters: {e}"))
+            })?
+            .decoder();
+        // Slice threads with an auto count; frame threading would hold frames back, adding
+        // latency and breaking the one frame per packet capture loop below.
+        decoder.set_threading(ffmpeg::threading::Config::kind(
+            ffmpeg::threading::Type::Slice,
+        ));
+        let decoder = decoder.video().map_err(|e| {
+            InferenceError::VideoError(format!("Failed to create webcam decoder: {e}"))
+        })?;
+
+        self.webcam_decoder = Some((ictx, decoder));
+        Ok(())
+    }
+
+    /// Get the next video frame.
+    #[cfg(feature = "video")]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[allow(unsafe_code, clippy::too_many_lines)]
+    fn next_video_frame(&mut self) -> Option<Result<(DynamicImage, SourceMeta)>> {
+        // Handle Webcam separately using native ffmpeg. Copy the index out so the source
+        // borrow ends before `open_webcam` takes `&mut self`.
+        let webcam_idx = match &self.source {
+            Source::Webcam(idx) => Some(*idx),
+            _ => None,
+        };
+        if let Some(idx) = webcam_idx {
+            if self.webcam_init_failed {
+                return None;
+            }
+
+            if self.webcam_decoder.is_none()
+                && let Err(e) = self.open_webcam(idx)
+            {
+                self.webcam_init_failed = true;
+                return Some(Err(e));
+            }
+            if let Some((ictx, decoder)) = &mut self.webcam_decoder {
+                let mut decoded = ffmpeg::util::frame::video::Video::empty();
+
+                // Read packets until we get a full frame
+                for (stream, packet) in ictx.packets() {
+                    if stream.index() == self.webcam_stream_index
+                        && decoder.send_packet(&packet).is_ok()
+                        && decoder.receive_frame(&mut decoded).is_ok()
+                    {
+                        let img = match frame_to_rgb_image(&mut self.webcam_scaler, &decoded) {
+                            Ok(img) => img,
+                            Err(e) => return Some(Err(e)),
+                        };
+
+                        let meta = SourceMeta {
+                            frame_idx: self.current_frame,
+                            total_frames: None,
+                            path: format!("Webcam {idx}"),
+                            fps: None,
+                        };
+                        self.current_frame += 1;
+                        return Some(Ok((img, meta)));
+                    }
+                }
+                return None; // End of stream or error
+            }
+            return None;
+        }
+
+        // Initialize decoder if needed (Video/Stream)
+        if self.decoder.is_none() {
+            if self.video_init_failed {
+                return None;
+            }
+
+            let path_str = match &self.source {
+                Source::Video(p) => Some(p.to_string_lossy().to_string()),
+                Source::Stream(s) => Some(s.clone()),
+                _ => None,
+            };
+
+            if let Some(path_str) = path_str {
+                match BilinearVideoDecoder::new(Path::new(&path_str)) {
+                    Ok(d) => {
+                        self.total_frames = d.total_frames;
+                        self.decoder = Some(d);
+                    }
+                    Err(e) => {
+                        self.video_init_failed = true;
+                        return Some(Err(InferenceError::VideoError(format!(
+                            "Failed to create decoder: {e}"
+                        ))));
+                    }
+                }
+            }
+        }
+
+        if let Some(decoder) = &mut self.decoder {
+            match decoder.decode_next() {
+                Some(Ok(img)) => {
+                    let meta = SourceMeta {
+                        frame_idx: self.current_frame,
+                        total_frames: self.total_frames,
+                        path: self
+                            .source
+                            .path()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        fps: Some(decoder.fps),
+                    };
+                    self.current_frame += 1;
+                    Some(Ok((img, meta)))
+                }
+                Some(Err(e)) => Some(Err(e)),
+                None => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(feature = "video"))]
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        clippy::needless_pass_by_ref_mut
+    )]
+    fn next_video_frame(&mut self) -> Option<Result<(DynamicImage, SourceMeta)>> {
+        Some(Err(InferenceError::FeatureNotEnabled(
+            "Video support requires '--features video'".to_string(),
+        )))
+    }
+}
+
+impl Iterator for SourceIterator {
+    type Item = Result<(DynamicImage, SourceMeta)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &self.source {
+            Source::Image(_) | Source::Directory(_) | Source::Glob(_) | Source::ImageList(_) => {
+                self.next_image()
+            }
+            Source::ImageUrl(url) => {
+                let url = url.clone();
+                self.next_image_url(&url)
+            }
+            Source::ImageBuffer(img) => {
+                if self.current_frame == 0 {
+                    self.current_frame = 1;
+                    let meta = SourceMeta::default();
+                    Some(Ok((img.clone(), meta)))
+                } else {
+                    None
+                }
+            }
+            Source::Array(arr) => {
+                if self.current_frame == 0 {
+                    self.current_frame = 1;
+                    let meta = SourceMeta::default();
+                    // Convert array to image
+                    match crate::utils::array_to_image(arr) {
+                        Ok(img) => Some(Ok((img, meta))),
+                        Err(e) => Some(Err(e)),
+                    }
+                } else {
+                    None
+                }
+            }
+            Source::Video(_) | Source::Webcam(_) | Source::Stream(_) => self.next_video_frame(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_source_from_string() {
+        assert!(matches!(Source::from("image.jpg"), Source::Image(_)));
+        assert!(matches!(Source::from("video.mp4"), Source::Video(_)));
+        assert!(matches!(
+            Source::from("rtsp://example.com"),
+            Source::Stream(_)
+        ));
+        assert!(matches!(Source::from("0"), Source::Webcam(0)));
+        assert!(matches!(Source::from("*.jpg"), Source::Glob(_)));
+    }
+
+    #[test]
+    fn test_source_checks() {
+        let img = Source::Image(PathBuf::from("test.jpg"));
+        assert!(img.is_image());
+        assert!(!img.is_video());
+
+        let vid = Source::Video(PathBuf::from("test.mp4"));
+        assert!(!vid.is_image());
+        assert!(vid.is_video());
+
+        let dir = Source::Directory(PathBuf::from("./images"));
+        assert!(dir.is_batch());
+    }
+
+    #[test]
+    fn test_from_str_url_classification() {
+        // Image extension over HTTP -> ImageUrl; otherwise treated as a stream.
+        assert!(matches!(
+            Source::from("https://example.com/cat.png"),
+            Source::ImageUrl(_)
+        ));
+        assert!(matches!(
+            Source::from("http://example.com/dog.JPEG?size=large"),
+            Source::ImageUrl(_)
+        ));
+        assert!(matches!(
+            Source::from("https://example.com/live/stream"),
+            Source::Stream(_)
+        ));
+        assert!(matches!(
+            Source::from("rtmp://example.com/live"),
+            Source::Stream(_)
+        ));
+    }
+
+    #[test]
+    fn test_from_str_video_extensions() {
+        for ext in ["mp4", "avi", "mov", "mkv", "webm", "m4v", "mpeg", "mpg"] {
+            let s = format!("clip.{ext}");
+            assert!(
+                matches!(Source::from(s.as_str()), Source::Video(_)),
+                "{ext}"
+            );
+        }
+        // Uppercase extension is normalized.
+        assert!(matches!(Source::from("CLIP.MP4"), Source::Video(_)));
+    }
+
+    #[test]
+    fn test_is_image_url_helper() {
+        assert!(Source::is_image_url("a/b/c.jpg"));
+        assert!(Source::is_image_url("a.PNG?x=1"));
+        assert!(Source::is_image_url("a.tiff"));
+        assert!(!Source::is_image_url("a.mp4"));
+        assert!(!Source::is_image_url("no_extension"));
+    }
+
+    #[test]
+    fn test_from_conversions() {
+        assert!(matches!(
+            Source::from(String::from("a.jpg")),
+            Source::Image(_)
+        ));
+        assert!(matches!(
+            Source::from(PathBuf::from("a.jpg")),
+            Source::Image(_)
+        ));
+        assert!(matches!(Source::from(Path::new("a.jpg")), Source::Image(_)));
+        assert!(matches!(
+            Source::from(image::DynamicImage::new_rgb8(2, 2)),
+            Source::ImageBuffer(_)
+        ));
+        assert!(matches!(
+            Source::from(Array3::<u8>::zeros((2, 2, 3))),
+            Source::Array(_)
+        ));
+        assert!(matches!(Source::from(3u32), Source::Webcam(3)));
+        assert!(matches!(Source::from(5i32), Source::Webcam(5)));
+    }
+
+    #[test]
+    fn test_path_accessor() {
+        assert!(Source::Image(PathBuf::from("a.jpg")).path().is_some());
+        assert!(Source::Video(PathBuf::from("a.mp4")).path().is_some());
+        assert!(Source::Directory(PathBuf::from("d")).path().is_some());
+        assert!(Source::Webcam(0).path().is_none());
+        assert!(Source::Stream("rtsp://x".into()).path().is_none());
+    }
+
+    #[test]
+    fn test_source_meta_default() {
+        let m = SourceMeta::default();
+        assert_eq!(m.frame_idx, 0);
+        assert_eq!(m.total_frames, Some(1));
+        assert_eq!(m.path, "");
+        assert!(m.fps.is_none());
+    }
+
+    /// Write a tiny valid image to `path`.
+    fn write_image(path: &Path) {
+        image::DynamicImage::new_rgb8(4, 4).save(path).unwrap();
+    }
+
+    #[test]
+    fn test_collect_images_from_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_image(&tmp.path().join("b.png"));
+        write_image(&tmp.path().join("a.jpg"));
+        std::fs::write(tmp.path().join("notes.txt"), b"ignore me").unwrap();
+
+        let paths = SourceIterator::collect_images_from_dir(tmp.path()).unwrap();
+        // Only the two images, sorted by name.
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("a.jpg"));
+        assert!(paths[1].ends_with("b.png"));
+
+        // Non-directory path is an error.
+        assert!(SourceIterator::collect_images_from_dir(Path::new("definitely/missing")).is_err());
+    }
+
+    #[test]
+    fn test_collect_images_from_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_image(&tmp.path().join("a.jpg"));
+        write_image(&tmp.path().join("b.png"));
+
+        // Extension-filtered glob picks only the matching extension.
+        let pattern = format!("{}/*.jpg", tmp.path().display());
+        let jpgs = SourceIterator::collect_images_from_glob(&pattern).unwrap();
+        assert_eq!(jpgs.len(), 1);
+        assert!(jpgs[0].ends_with("a.jpg"));
+
+        // Bare `*` (no extension) falls back to any image file.
+        let all_pattern = format!("{}/*", tmp.path().display());
+        let all = SourceIterator::collect_images_from_glob(&all_pattern).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Missing directory is an error.
+        assert!(SourceIterator::collect_images_from_glob("missing_dir/*.jpg").is_err());
+
+        // No star: treated as a single literal path.
+        let single = SourceIterator::collect_images_from_glob("just/a/file.jpg").unwrap();
+        assert_eq!(single, vec![PathBuf::from("just/a/file.jpg")]);
+    }
+
+    #[test]
+    fn test_iterator_image_buffer_yields_once() {
+        let src = Source::ImageBuffer(image::DynamicImage::new_rgb8(4, 4));
+        let mut it = SourceIterator::new(src).unwrap();
+        assert!(it.next().is_some());
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn test_iterator_array_yields_once() {
+        let src = Source::Array(Array3::<u8>::zeros((4, 4, 3)));
+        let mut it = SourceIterator::new(src).unwrap();
+        let first = it.next().unwrap();
+        assert!(first.is_ok());
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn test_iterator_over_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_image(&tmp.path().join("a.jpg"));
+        write_image(&tmp.path().join("b.png"));
+
+        let src = Source::Directory(tmp.path().to_path_buf());
+        let it = SourceIterator::new(src).unwrap();
+        let count = it.flatten().count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_iterator_image_list_and_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("a.jpg");
+        write_image(&good);
+        let missing = tmp.path().join("missing.jpg");
+
+        let src = Source::ImageList(vec![good, missing]);
+        let mut it = SourceIterator::new(src).unwrap();
+        assert!(it.next().unwrap().is_ok()); // good image decodes
+        assert!(it.next().unwrap().is_err()); // missing path errors, no panic
+        assert!(it.next().is_none());
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn test_iterator_over_video_file() {
+        use crate::io::VideoWriter;
+
+        // Encode a short real mp4, then decode it back through the iterator.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clip.mp4");
+        let mut writer = VideoWriter::new(&path, 32, 32, 10.0).unwrap();
+        for _ in 0..5 {
+            writer
+                .write_frame(&image::DynamicImage::new_rgb8(32, 32))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let src = Source::Video(path);
+        assert!(src.is_video());
+        let mut it = SourceIterator::new(src).unwrap();
+        // Decode at least the first frame back as an image.
+        let (frame, _meta) = it.next().expect("a frame").expect("decodes");
+        assert_eq!(frame.width(), 32);
+        // Drain the rest; the iterator terminates cleanly at end-of-stream.
+        let mut decoded = 1;
+        for item in it.by_ref() {
+            if item.is_ok() {
+                decoded += 1;
+            }
+        }
+        assert!(decoded >= 1);
+        assert!(it.next().is_none());
+    }
+}

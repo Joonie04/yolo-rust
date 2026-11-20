@@ -1,0 +1,21 @@
+# 精度评估示例（classify，top1/top5 准确率）。
+# 用法: cargo run -- eval config/eval_classify.toml
+# 输出: results/eval_report.json
+#
+# dataset.annotations 为简单标签 JSON：{"images":[{"file","class"}]}。
+# 本示例的标签取模型自身 top1，跑通应得 top1_accuracy = top5_accuracy = 1.0，
+# 用于冒烟验证 classify 评估链路。
+
+[model]
+path = "models/cls/yolo26n-cls.onnx"
+
+[dataset]
+images = "data"
+annotations = "data/eval/classify_labels.json"
+
+[inference]
+device = "cpu"
+threads = 0
+
+[eval]
+dir = "results"

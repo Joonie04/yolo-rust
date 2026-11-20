@@ -1,0 +1,21 @@
+# 深度估计示例（yolo26 独有）
+# 用法: cargo run -- config/depth.toml
+
+[model]
+path = "models/depth/yolo26m-depth.onnx"
+
+[source]
+type = "image"
+path = "data/depth/kids.jpg"
+
+[inference]
+device = "cpu"
+threads = 0
+
+[output]
+save_annotated = true
+save_json = true
+dir = "results"
+
+[logging]
+verbose = true

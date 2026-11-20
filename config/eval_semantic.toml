@@ -1,0 +1,23 @@
+# 精度评估示例（semantic，像素级标签图 → mIoU）。
+# 用法: cargo run -- eval config/eval_semantic.toml
+# 输出: results/eval_report.json
+#
+# 本示例用 `cargo run --example make_semantic_gt` 生成的合成标签（真值 == 模型自身语义图），
+# 跑通应得 mIoU = 1.0，用于端到端冒烟验证 semantic 评估链路。
+#
+# dataset.annotations 为简单标签 JSON：{"images":[{"file","label"}]}，
+# label 是 8 位灰度 PNG（像素值 = 类别 id），相对 dataset.images 目录解析。
+
+[model]
+path = "models/sem/yolo26n-sem.onnx"
+
+[dataset]
+images = "data/eval/images"
+annotations = "data/eval/semantic_labels.json"
+
+[inference]
+device = "cpu"
+threads = 0
+
+[eval]
+dir = "results"

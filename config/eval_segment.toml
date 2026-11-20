@@ -1,0 +1,27 @@
+# 精度评估示例（segment，COCO 分割 → 掩码 IoU mAP）。
+# 用法: cargo run -- eval config/eval_segment.toml
+# 输出: results/eval_report.json
+#
+# 本示例用 `cargo run --example make_segment_gt` 生成的合成 COCO 集（真值 == 模型自身掩码），
+# 跑通应得 mAP@0.5 = mAP@0.5:0.95 = 1.0，用于端到端冒烟验证掩码 mAP 链路。
+#
+# 真实 COCO 实例分割等价性评估时，把 conf 改为 0.001、并把 dataset 指向
+# 你的 COCO 图片目录与 instances_val2017.json（segmentation 为多边形）。
+
+[model]
+path = "models/seg/yolo26n-seg.onnx"
+
+[dataset]
+images = "data/eval/images"
+annotations = "data/eval/annotations_seg.json"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[eval]
+dir = "results"

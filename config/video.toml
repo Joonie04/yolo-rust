@@ -1,0 +1,30 @@
+# 视频推理示例：逐帧推理 → 标注 mp4 + 帧级 JSON。
+# 需要 `video` feature（依赖系统 FFmpeg 开发库）：
+#   cargo run --release --features video -- config/video.toml
+# 输出：results/video/<task>/<时间戳>/ 下 sample.mp4（标注视频）+ results.json（含 frame_idx）。
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[source]
+type = "video"
+path = "data/sample.mp4"
+# stride = 1          # 抽帧步长（默认 1 = 每帧）
+# max_frames = 50     # 最多处理多少帧（默认到结尾）
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[output]
+save_annotated = true   # 写回标注 mp4（save_frames=false）或逐帧存图（save_frames=true）
+save_json = true        # 帧级 JSON（每帧一个元素，含 frame_idx）
+save_frames = false     # true = 逐帧存到 <stem>_frames/，false = 写回单个 mp4
+dir = "results/video"
+
+[logging]
+verbose = false         # 视频帧多，关闭逐帧摘要

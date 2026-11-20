@@ -1,0 +1,27 @@
+# 目录批量推理示例：遍历 data/ 下全部图片，单张失败不中断，打印进度与 ETA。
+# 用法: cargo run -- config/detect_dir.toml
+#
+# verbose = false 时只打印进度行与汇总，适合大批量；置 true 会额外打印每张图摘要。
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[source]
+type = "directory"
+path = "data"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[output]
+save_annotated = true
+save_json = true
+dir = "results"
+
+[logging]
+verbose = false

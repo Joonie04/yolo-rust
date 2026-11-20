@@ -1,0 +1,23 @@
+# 工程基准（DirectML GPU，Windows 专用，无需 CUDA/cuDNN 版本匹配）。
+# 用法: cargo run --release --features directml -- bench config/bench_directml.toml
+# 输出: results/bench_directml/bench_report.json
+
+[model]
+path = "models/det/yolo26m.onnx"
+
+[source]
+type = "directory"
+path = "data/bench"
+
+[inference]
+device = "directml:0"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[bench]
+warmup = 3
+iterations = 20
+dir = "results/bench_directml"

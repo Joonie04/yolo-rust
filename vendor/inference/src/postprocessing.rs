@@ -1,0 +1,3146 @@
+// Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+//! Post-processing for YOLO model outputs.
+//!
+//! This module handles task-specific post-processing of raw model outputs,
+//! including NMS, coordinate transformation, and result construction.
+
+#![allow(
+    unsafe_code,
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::if_not_else,
+    clippy::ptr_as_ptr,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use wide::f32x8;
+
+#[allow(clippy::wildcard_imports)] // native: rayon prelude; wasm: sequential shims
+use crate::parallel::*;
+use fast_image_resize::images::{Image, ImageRef};
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use ndarray::{Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut2, Zip, s};
+
+use crate::inference::InferenceConfig;
+use crate::preprocessing::{PreprocessResult, clip_coords, scale_coords};
+use crate::results::{Boxes, DepthMap, Keypoints, Masks, Obb, Probs, Results, SemanticMask, Speed};
+use crate::task::Task;
+use crate::utils::{nms_per_class_capped, nms_rotated_per_class_capped, xywh_to_xyxy};
+
+/// Post-process raw model output based on task type.
+///
+/// # Arguments
+///
+/// * `outputs` - Vector of raw model outputs (data, shape).
+/// * `task` - The task type (detect, segment, pose, etc.).
+/// * `preprocess` - Preprocessing result containing scale/padding info.
+/// * `config` - Inference configuration.
+/// * `names` - Class ID to name mapping.
+/// * `orig_img` - Original image as HWC array.
+/// * `path` - Source image path.
+/// * `speed` - Timing information.
+/// * `inference_shape` - The inference tensor shape (height, width) after letterboxing.
+///
+/// # Returns
+///
+/// Processed Results object.
+#[must_use]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub fn postprocess(
+    outputs: Vec<(&[f32], Vec<usize>)>,
+    task: Task,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    names: Arc<HashMap<usize, String>>,
+    orig_img: Array3<u8>,
+    path: String,
+    speed: Speed,
+    inference_shape: (u32, u32),
+    end2end: bool,
+    kpt_shape: Option<(usize, usize)>,
+) -> Results {
+    postprocess_with_head(
+        outputs,
+        task,
+        preprocess,
+        config,
+        names,
+        orig_img,
+        path,
+        speed,
+        inference_shape,
+        end2end,
+        kpt_shape,
+        false,
+    )
+}
+
+/// Post-process raw model output, selecting the RT-DETR decode when `rtdetr` is set.
+///
+/// Same as [`postprocess`], plus `rtdetr`: RT-DETR shares the `[1, max_det, 6]` tensor shape
+/// of the NMS-free YOLO head but reports `[cx, cy, w, h]` normalized to the input, so the two
+/// cannot be told apart from the tensors alone and the caller has to say which it holds.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::similar_names,
+    clippy::implicit_hasher
+)]
+pub fn postprocess_with_head(
+    outputs: Vec<(&[f32], Vec<usize>)>,
+    task: Task,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    names: Arc<HashMap<usize, String>>,
+    orig_img: Array3<u8>,
+    path: String,
+    speed: Speed,
+    inference_shape: (u32, u32),
+    end2end: bool,
+    kpt_shape: Option<(usize, usize)>,
+    rtdetr: bool,
+) -> Results {
+    let results = Results::new(orig_img, path, names, speed, inference_shape);
+    match task {
+        Task::Detect => {
+            let (output, shape) = &outputs[0];
+            // RT-DETR decodes through the same walk, given the size to denormalize against.
+            if rtdetr || end2end || is_end2end_shape(shape, 6) {
+                postprocess_detect_end2end(
+                    output,
+                    shape,
+                    preprocess,
+                    config,
+                    results,
+                    rtdetr.then_some(inference_shape),
+                )
+            } else {
+                postprocess_detect(output, shape, preprocess, config, results)
+            }
+        }
+        Task::Segment => {
+            // Derive proto channel count from the second output tensor (shape `[1, nm, mh, mw]`),
+            // so exports with non-default prototype counts are still classified correctly.
+            let proto_channels = outputs
+                .get(1)
+                .and_then(|(_, s)| if s.len() == 4 { Some(s[1]) } else { None });
+            if end2end || is_end2end_segment_shape(&outputs[0].1, proto_channels) {
+                postprocess_segment_end2end(outputs, preprocess, config, results)
+            } else {
+                postprocess_segment(outputs, preprocess, config, results)
+            }
+        }
+        Task::Semantic => {
+            let (output, shape) = &outputs[0];
+            let n_classes = results.names.len();
+            let mut results = postprocess_semantic(output, shape, results);
+            // Adapt the `classes` filter to semantic segmentation: pixels whose
+            // class is not kept become IGNORE. Only meaningful for multi-class
+            // models, matching Ultralytics.
+            if n_classes > 1
+                && config.classes.is_some()
+                && let Some(sm) = results.semantic_mask.as_mut()
+            {
+                for px in &mut sm.data {
+                    if !config.keep_class(usize::from(*px)) {
+                        *px = SemanticMask::IGNORE;
+                    }
+                }
+            }
+            results
+        }
+        Task::Depth => {
+            let (output, shape) = &outputs[0];
+            postprocess_depth(output, shape, results)
+        }
+        Task::Classify => {
+            let (output, _) = &outputs[0];
+            postprocess_classify(output, results)
+        }
+        Task::Pose => {
+            let (output, shape) = &outputs[0];
+            // Prefer metadata-provided `kpt_shape`; otherwise infer the keypoint
+            // layout from the tensor shape so non-COCO pose models still work.
+            let resolved_kpt = kpt_shape.or_else(|| infer_end2end_kpt_shape(shape));
+            let is_end2end = end2end
+                || resolved_kpt.is_some_and(|(nk, kd)| is_end2end_shape(shape, 6 + nk * kd));
+            let (nk, kpt_dim) = resolved_kpt.unwrap_or((17, 3));
+            if is_end2end {
+                postprocess_pose_end2end(output, shape, preprocess, config, results, nk, kpt_dim)
+            } else {
+                postprocess_pose(output, shape, preprocess, config, results, nk, kpt_dim)
+            }
+        }
+        Task::Obb => {
+            let (output, shape) = &outputs[0];
+            if end2end || is_end2end_shape(shape, 7) {
+                postprocess_obb_end2end(output, shape, preprocess, config, results)
+            } else {
+                postprocess_obb(output, shape, preprocess, config, results)
+            }
+        }
+    }
+}
+
+/// Largest `max_det` an end2end head is assumed to emit. A wider second dimension means the
+/// tensor is a raw head being misread as end2end, so the shape is rejected.
+const MAX_END2END_DETECTIONS: usize = 4096;
+
+/// Detect if a 3D shape matches a YOLO26 end2end layout `[1, max_det, features]`.
+///
+/// Each task differs only in `features`: 6 for detect, `6 + nm` for segment,
+/// `6 + nk * kpt_dim` for pose, and 7 for OBB.
+const fn is_end2end_shape(shape: &[usize], features: usize) -> bool {
+    shape.len() == 3 && shape[2] == features && shape[1] <= MAX_END2END_DETECTIONS
+}
+
+/// Detect if a 3D shape matches YOLO26 end2end segment layout `[1, max_det, 6 + nm]`.
+///
+/// When the proto tensor's channel count is known (passed via `proto_channels`),
+/// it is used as the authoritative `nm`; otherwise the shape is rejected since
+/// hardcoding `nm=32` would misclassify exports with non-default prototype counts.
+fn is_end2end_segment_shape(shape: &[usize], proto_channels: Option<usize>) -> bool {
+    proto_channels.is_some_and(|nm| is_end2end_shape(shape, 6 + nm))
+}
+
+/// Infer `(nk, kpt_dim)` from a pose tensor shape assumed to be end-to-end
+/// (`[1, max_det, 6 + nk*kpt_dim]`). Used only when `kpt_shape` metadata is absent.
+///
+/// Returns `None` for shapes that don't match the end-to-end layout, and for
+/// shapes where `kpt_feats` is divisible by both 2 and 3 (e.g. 36, 42) because
+/// the layout is ambiguous: `(12, 3)` and `(18, 2)` both decode the same
+/// tensor. Ambiguous cases fall through to the legacy pose path rather than
+/// silently guessing the wrong dimension.
+const fn infer_end2end_kpt_shape(shape: &[usize]) -> Option<(usize, usize)> {
+    if shape.len() != 3 || shape[1] == 0 || shape[1] > MAX_END2END_DETECTIONS || shape[2] <= 6 {
+        return None;
+    }
+    let kpt_feats = shape[2] - 6;
+    let div3 = kpt_feats.is_multiple_of(3);
+    let div2 = kpt_feats.is_multiple_of(2);
+    match (div3, div2) {
+        (true, false) => Some((kpt_feats / 3, 3)),
+        (false, true) => Some((kpt_feats / 2, 2)),
+        _ => None, // not divisible by either, or ambiguous (divisible by 6)
+    }
+}
+
+/// Post-process detection model output.
+///
+/// Zero-copy implementation using stride-based indexing to avoid memory allocations.
+#[allow(clippy::similar_names, clippy::cast_precision_loss)]
+fn postprocess_detect(
+    output: &[f32],
+    output_shape: &[usize],
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+) -> Results {
+    // Parse output shape - handle both [1, 84, 8400] and [1, 8400, 84] formats
+    let (num_classes, num_predictions, is_transposed) =
+        parse_detect_shape(output_shape, results.names.len());
+
+    if output.is_empty() || num_predictions == 0 {
+        return results;
+    }
+
+    // Zero-copy extraction with stride-based indexing
+    let boxes_data = extract_detect_boxes(
+        output,
+        num_classes,
+        num_predictions,
+        is_transposed,
+        preprocess,
+        config,
+    );
+
+    if !boxes_data.is_empty() {
+        results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+    }
+
+    results
+}
+
+/// Infer `(num_classes, num_preds, transposed)` from a 2D shape with no metadata: the smaller
+/// dimension is the feature count.
+fn infer_detect_shape(a: usize, b: usize) -> (usize, usize, bool) {
+    let (num_features, num_preds, transposed) = if a < b { (a, b, false) } else { (b, a, true) };
+    (num_features.saturating_sub(4).max(1), num_preds, transposed)
+}
+
+/// Parse detection output shape to determine format.
+///
+/// Derives class count from output shape when metadata is missing (`expected_classes` == 0).
+/// YOLO outputs are either [1, `num_features`, `num_preds`] or [1, `num_preds`, `num_features`]
+/// where `num_features` = 4 (bbox) + `num_classes`.
+fn parse_detect_shape(shape: &[usize], expected_classes: usize) -> (usize, usize, bool) {
+    match shape.len() {
+        2 => {
+            // [num_preds, num_features] or [num_features, num_preds]
+            let (a, b) = (shape[0], shape[1]);
+            // Handle edge case where either dimension is less than 4
+            if a < 4 && b < 4 {
+                return (expected_classes.max(1), 0, false);
+            }
+            // When metadata is missing, infer from shape:
+            // The smaller dimension (if >= 5) is likely num_features, larger is num_preds
+            if expected_classes == 0 {
+                // No metadata - infer from shape
+                return infer_detect_shape(a, b);
+            }
+            if a == 4 + expected_classes || (a >= 4 && a > b) {
+                // [num_features, num_preds]
+                (a.saturating_sub(4), b, false)
+            } else {
+                // [num_preds, num_features]
+                (b.saturating_sub(4), a, true)
+            }
+        }
+        3 => {
+            // [batch, ...] - ignore batch dimension
+            let (a, b) = (shape[1], shape[2]);
+            // Handle edge case where num_predictions is 0 or very small
+            if b == 0 || a < 4 {
+                return (expected_classes.max(1), 0, false);
+            }
+            // When metadata is missing, infer from shape
+            if expected_classes == 0 {
+                // No metadata - infer from shape
+                // Typically num_features < num_preds (e.g., 84 < 8400)
+                return infer_detect_shape(a, b);
+            }
+            if a == 4 + expected_classes || (expected_classes > 0 && a < b) {
+                // [1, num_features, num_preds]
+                (a.saturating_sub(4), b, false)
+            } else {
+                // [1, num_preds, num_features]
+                (b.saturating_sub(4), a, true)
+            }
+        }
+        _ => (expected_classes.max(1), 0, false),
+    }
+}
+
+/// Scale a corner-form box from letterboxed inference space back to the original
+/// image, then clip it to the image bounds.
+#[inline]
+fn scale_and_clip_box(xyxy: &[f32; 4], preprocess: &PreprocessResult) -> [f32; 4] {
+    let scaled = scale_coords(xyxy, preprocess.scale, preprocess.padding);
+    clip_coords(&scaled, preprocess.orig_shape)
+}
+
+/// Scale a single keypoint from letterboxed inference space back to the original
+/// image, then clamp it to the image bounds.
+#[inline]
+fn scale_keypoint(x: f32, y: f32, preprocess: &PreprocessResult) -> (f32, f32) {
+    let scaled = scale_coords(&[x, y, x, y], preprocess.scale, preprocess.padding);
+    #[allow(clippy::cast_precision_loss)]
+    let (max_h, max_w) = (
+        preprocess.orig_shape.0 as f32,
+        preprocess.orig_shape.1 as f32,
+    );
+    (scaled[0].clamp(0.0, max_w), scaled[1].clamp(0.0, max_h))
+}
+
+/// Append `nk` keypoints of `kpt_dim` channels from `kpts`, with x/y scaled to original image
+/// space. The channels after x/y (the visibility score, when the export carries one) pass through.
+fn push_keypoints(
+    kpts: &ArrayView1<f32>,
+    nk: usize,
+    kpt_dim: usize,
+    preprocess: &PreprocessResult,
+    out: &mut Vec<f32>,
+) {
+    for off in (0..nk).map(|k| k * kpt_dim) {
+        let (x, y) = scale_keypoint(kpts[off], kpts[off + 1], preprocess);
+        out.push(x);
+        out.push(y);
+        out.extend((2..kpt_dim).map(|c| kpts[off + c]));
+    }
+}
+
+/// Return the `(index, score)` of the highest class score. NaN scores (and an empty row) map to
+/// negative infinity before the reduction, so a NaN can never win selection over a real score,
+/// and an all-NaN or empty row scores below any confidence threshold (even `0.0`) rather than
+/// masquerading as a genuine zero-confidence detection.
+fn best_class_score(scores: &ArrayView1<f32>) -> (usize, f32) {
+    scores
+        .iter()
+        .enumerate()
+        .map(|(idx, &score)| {
+            (
+                idx,
+                if score.is_nan() {
+                    f32::NEG_INFINITY
+                } else {
+                    score
+                },
+            )
+        })
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .unwrap_or((0, f32::NEG_INFINITY))
+}
+
+/// Decode row `i` of a `[preds, features]` head into a detection candidate.
+///
+/// Picks the best of the `num_classes` class scores and, when it clears the confidence
+/// threshold and the class filter, returns the box scaled back to the original image and
+/// clipped to it, with its score and class. `None` means the row is dropped.
+fn decode_row(
+    output_2d: &Array2<f32>,
+    i: usize,
+    num_classes: usize,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+) -> Option<([f32; 4], f32, usize)> {
+    let (best_class, best_score) = best_class_score(&output_2d.slice(s![i, 4..4 + num_classes]));
+    if best_score < config.confidence_threshold || !config.keep_class(best_class) {
+        return None;
+    }
+    let bbox = scale_and_clip_box(
+        &xywh_to_xyxy(
+            output_2d[[i, 0]],
+            output_2d[[i, 1]],
+            output_2d[[i, 2]],
+            output_2d[[i, 3]],
+        ),
+        preprocess,
+    );
+    Some((bbox, best_score, best_class))
+}
+
+/// Run per-class NMS over `(bbox, score, class, extra)` candidates and return the kept
+/// indices, capped at `max_det`. The `extra` payload (mask index, keypoints, ...) is
+/// ignored here and looked up by the caller via the returned indices.
+fn nms_keep_indices<T>(
+    candidates: &[([f32; 4], f32, usize, T)],
+    iou_threshold: f32,
+    max_det: usize,
+) -> Vec<usize> {
+    let nms_candidates: Vec<_> = candidates
+        .iter()
+        .map(|(bbox, score, class, _)| (*bbox, *score, *class))
+        .collect();
+    nms_per_class_capped(&nms_candidates, iou_threshold, max_det)
+}
+
+/// Write one `[x1, y1, x2, y2, score, class]` detection row into a `(_, 6)` boxes array.
+#[allow(clippy::cast_precision_loss)]
+fn write_box_row(boxes: &mut Array2<f32>, row: usize, bbox: &[f32; 4], score: f32, class: usize) {
+    boxes[[row, 0]] = bbox[0];
+    boxes[[row, 1]] = bbox[1];
+    boxes[[row, 2]] = bbox[2];
+    boxes[[row, 3]] = bbox[3];
+    boxes[[row, 4]] = score;
+    boxes[[row, 5]] = class as f32;
+}
+
+/// Reshape a flat model output into a `[preds, features]` 2D array.
+///
+/// When `is_transposed` the data is already laid out `[preds, features]`;
+/// otherwise it is `[features, preds]` and gets transposed. Returns an empty
+/// array on shape mismatch, matching the per-task fallbacks.
+///
+/// The length check is exact on purpose. `ArrayView2::from_shape` accepts a buffer *longer*
+/// than the shape needs and silently views a prefix, so a feature count that disagrees with
+/// the tensor would otherwise reinterpret the output with the wrong stride and decode
+/// plausible-looking garbage instead of reporting a mismatch.
+fn output_to_2d(
+    data: &[f32],
+    num_preds: usize,
+    features: usize,
+    is_transposed: bool,
+) -> Array2<f32> {
+    if num_preds
+        .checked_mul(features)
+        .is_none_or(|len| len != data.len())
+    {
+        return Array2::zeros((0, 0));
+    }
+
+    let shape = if is_transposed {
+        (num_preds, features)
+    } else {
+        (features, num_preds)
+    };
+    let Ok(view) = ArrayView2::from_shape(shape, data) else {
+        return Array2::zeros((0, 0));
+    };
+    // The transpose is materialized on purpose: callers walk a prediction at a time, and a
+    // strided view would read a column per access.
+    if is_transposed {
+        view.to_owned()
+    } else {
+        view.t().to_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    bbox: [f32; 4],
+    score: f32,
+    class: usize,
+}
+
+/// Optimized detection extraction with SIMD acceleration.
+///
+/// Key optimizations:
+/// - SIMD-accelerated candidate extraction (f32x8)
+/// - Parallel Bitmask NMS (IoU 1 vs 8)
+/// - Struct-of-Arrays (SoA) layout for NMS cache locality
+/// - Direct unsafe indexing for performance
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+fn extract_detect_boxes(
+    output: &[f32],
+    num_classes: usize,
+    num_predictions: usize,
+    is_transposed: bool,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+) -> Array2<f32> {
+    let feat_count = 4 + num_classes;
+    let orig_shape = preprocess.orig_shape;
+    let conf_thresh = config.confidence_threshold;
+    let max_det = config.max_det;
+    let iou_thresh = config.iou_threshold;
+    let conf_v = f32x8::splat(conf_thresh);
+
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(256);
+    // Keep a row that cleared the threshold when its class passes the filter, reading its
+    // `[cx, cy, w, h]` from `output[base + k * step]` and scaling it to the original image.
+    let mut push_candidate = |base: usize, step: usize, score: f32, class: usize| {
+        if !config.keep_class(class) {
+            return;
+        }
+        let at = |k: usize| unsafe { *output.get_unchecked(base + k * step) };
+        let bbox = scale_coords(
+            &xywh_to_xyxy(at(0), at(1), at(2), at(3)),
+            preprocess.scale,
+            preprocess.padding,
+        );
+        candidates.push(Candidate { bbox, score, class });
+    };
+
+    // Candidate Extraction
+    if !is_transposed {
+        // Layout [feat, pred] - Cache-friendly linear scan
+        let mut max_scores = vec![conf_thresh; num_predictions];
+        let mut max_classes = vec![0usize; num_predictions];
+
+        for c in 0..num_classes {
+            let offset = (4 + c) * num_predictions;
+            let class_scores = &output[offset..offset + num_predictions];
+            for (idx, &score) in class_scores.iter().enumerate() {
+                if score > max_scores[idx] {
+                    max_scores[idx] = score;
+                    max_classes[idx] = c;
+                }
+            }
+        }
+
+        for (idx, &score) in max_scores.iter().enumerate() {
+            if score > conf_thresh {
+                push_candidate(idx, num_predictions, score, max_classes[idx]);
+            }
+        }
+    } else {
+        // Layout [pred, feat] - Process 8 classes at once
+        for idx in 0..num_predictions {
+            let base = idx * feat_count;
+            let row_ptr = unsafe { output.as_ptr().add(base + 4) };
+            let mut best_score = conf_thresh;
+            let mut best_class = 0;
+
+            for c_idx in (0..num_classes).step_by(8) {
+                if num_classes - c_idx >= 8 {
+                    let scores: f32x8 =
+                        unsafe { (row_ptr.add(c_idx) as *const f32x8).read_unaligned() };
+                    if scores.simd_gt(conf_v).any() {
+                        for i in 0..8 {
+                            let s = unsafe { *row_ptr.add(c_idx + i) };
+                            if s > best_score {
+                                best_score = s;
+                                best_class = c_idx + i;
+                            }
+                        }
+                    }
+                } else {
+                    for i in c_idx..num_classes {
+                        let s = unsafe { *row_ptr.add(i) };
+                        if s > best_score {
+                            best_score = s;
+                            best_class = i;
+                        }
+                    }
+                }
+            }
+
+            if best_score > conf_thresh {
+                push_candidate(base, 1, best_score, best_class);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Array2::zeros((0, 6));
+    }
+
+    // Top-K Selection & Sort. `total_cmp` keeps a NaN score from panicking, and both of these
+    // need the total order it provides: `select_nth_unstable_by` has unspecified behavior with
+    // an inconsistent comparator.
+    let nms_limit = (max_det * 10).min(candidates.len());
+    if candidates.len() > nms_limit {
+        candidates.select_nth_unstable_by(nms_limit, |a, b| b.score.total_cmp(&a.score));
+        candidates.truncate(nms_limit);
+    }
+    candidates.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+
+    // Population of SoA for NMS (small copy, very fast)
+    let n = candidates.len();
+    let mut x1 = Vec::with_capacity(n);
+    let mut y1 = Vec::with_capacity(n);
+    let mut x2 = Vec::with_capacity(n);
+    let mut y2 = Vec::with_capacity(n);
+    let mut areas = Vec::with_capacity(n);
+
+    for c in &candidates {
+        x1.push(c.bbox[0]);
+        y1.push(c.bbox[1]);
+        x2.push(c.bbox[2]);
+        y2.push(c.bbox[3]);
+        areas.push((c.bbox[2] - c.bbox[0]) * (c.bbox[3] - c.bbox[1]));
+    }
+
+    let mut suppressed = vec![false; n];
+    let mut keep = Vec::with_capacity(max_det);
+    let iou_v = f32x8::splat(iou_thresh);
+    for i in 0..n {
+        if suppressed[i] {
+            continue;
+        }
+        keep.push(i);
+        if keep.len() >= max_det {
+            break;
+        }
+
+        let ax1 = f32x8::splat(x1[i]);
+        let ay1 = f32x8::splat(y1[i]);
+        let ax2 = f32x8::splat(x2[i]);
+        let ay2 = f32x8::splat(y2[i]);
+        let aa = f32x8::splat(areas[i]);
+        let ac = candidates[i].class;
+
+        let mut j = i + 1;
+        while j < n {
+            if n - j >= 8 {
+                if (0..8).any(|k| candidates[j + k].class == ac && !suppressed[j + k]) {
+                    let bx1 = unsafe { (x1.as_ptr().add(j) as *const f32x8).read_unaligned() };
+                    let by1 = unsafe { (y1.as_ptr().add(j) as *const f32x8).read_unaligned() };
+                    let bx2 = unsafe { (x2.as_ptr().add(j) as *const f32x8).read_unaligned() };
+                    let by2 = unsafe { (y2.as_ptr().add(j) as *const f32x8).read_unaligned() };
+                    let ba = unsafe { (areas.as_ptr().add(j) as *const f32x8).read_unaligned() };
+
+                    let ix1 = ax1.max(bx1);
+                    let iy1 = ay1.max(by1);
+                    let ix2 = ax2.min(bx2);
+                    let iy2 = ay2.min(by2);
+
+                    let iw = (ix2 - ix1).max(f32x8::ZERO);
+                    let ih = (iy2 - iy1).max(f32x8::ZERO);
+                    let ia = iw * ih;
+                    let iou = ia / (aa + ba - ia);
+
+                    let mask = iou.simd_gt(iou_v).to_bitmask() as u8;
+                    if mask != 0 {
+                        for k in 0..8 {
+                            if (mask & (1 << k)) != 0 && candidates[j + k].class == ac {
+                                suppressed[j + k] = true;
+                            }
+                        }
+                    }
+                }
+                j += 8;
+            } else {
+                for k in j..n {
+                    if !suppressed[k] && candidates[k].class == ac {
+                        let ix1 = x1[i].max(x1[k]);
+                        let iy1 = y1[i].max(y1[k]);
+                        let ix2 = x2[i].min(x2[k]);
+                        let iy2 = y2[i].min(y2[k]);
+                        let iw = (ix2 - ix1).max(0.0);
+                        let ih = (iy2 - iy1).max(0.0);
+                        let ia = iw * ih;
+                        let iou = ia / (areas[i] + areas[k] - ia);
+                        if iou > iou_thresh {
+                            suppressed[k] = true;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    // Result Construction
+    let mut result = Array2::zeros((keep.len(), 6));
+    for (out_idx, &idx) in keep.iter().enumerate() {
+        let c = &candidates[idx];
+        write_box_row(
+            &mut result,
+            out_idx,
+            &clip_coords(&c.bbox, orig_shape),
+            c.score,
+            c.class,
+        );
+    }
+
+    result
+}
+
+/// Shared sigmoid -> resize -> bbox-mask pipeline used by both segment post-processors.
+///
+/// Applies sigmoid to `mask_flat`, resizes from the prototype grid (`mw×mh`) to the
+/// original image size (`ow×oh`) with a letterbox crop, then zeros pixels outside the
+/// bounding box stored in `box_data[0..4]` (x1, y1, x2, y2).
+///
+/// The bilinear resize runs as two single-axis passes so only the box columns are ever
+/// resized to full height, instead of the whole `ow×oh` frame per detection. Each pass
+/// gets the same crop and destination size along its axis as a single full-frame resize,
+/// so `fast_image_resize` computes the same coefficients, the same f32 intermediate rows,
+/// and the output is exactly the same.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn apply_mask_proto(
+    mut mask_out: ArrayViewMut2<f32>,
+    mask_flat: &ArrayView1<f32>,
+    box_data: &ArrayView1<f32>,
+    mw: usize,
+    mh: usize,
+    ow: u32,
+    oh: u32,
+    crop_x: f32,
+    crop_y: f32,
+    crop_w: f32,
+    crop_h: f32,
+) {
+    let x1 = box_data[0].max(0.0).min(ow as f32);
+    let y1 = box_data[1].max(0.0).min(oh as f32);
+    let x2 = box_data[2].max(0.0).min(ow as f32);
+    let y2 = box_data[3].max(0.0).min(oh as f32);
+
+    if ow == 0 || oh == 0 {
+        return;
+    }
+
+    // Only pixels inside the box are ever written and `mask_out` arrives zeroed from the
+    // caller's `Array3::zeros`, so walk the box instead of testing every pixel in the frame.
+    // The bounds are the integer pixels satisfying the old `x >= x1 && x <= x2` test; a
+    // degenerate box gives an empty range and writes nothing, as before.
+    let x_start = x1.ceil() as usize;
+    let y_start = y1.ceil() as usize;
+    let x_end = (x2.floor() as usize).min(ow as usize - 1);
+    let y_end = (y2.floor() as usize).min(oh as usize - 1);
+
+    if x_start > x_end || y_start > y_end {
+        return;
+    }
+
+    let f32_data: Vec<f32> = mask_flat
+        .iter()
+        .map(|&v| 1.0 / (1.0 + (-v).exp()))
+        .collect();
+    let src_bytes: &[u8] = bytemuck::cast_slice(&f32_data);
+    let Ok(src_image) = ImageRef::new(mw as u32, mh as u32, src_bytes, PixelType::F32) else {
+        return;
+    };
+
+    let mut resizer = Resizer::new();
+    let resize_alg = ResizeAlg::Convolution(FilterType::Bilinear);
+
+    // Horizontal pass: every prototype row resized to the full output width. Keeping all
+    // `mh` rows at an integer top makes `fast_image_resize` skip its vertical pass.
+    let mut rows = Image::new(ow, mh as u32, PixelType::F32);
+    let options = ResizeOptions::new().resize_alg(resize_alg).crop(
+        f64::from(crop_x.max(0.0)),
+        0.0,
+        f64::from(crop_w.max(1.0).min(mw as f32)),
+        mh as f64,
+    );
+    if resizer.resize(&src_image, &mut rows, &options).is_err() {
+        return;
+    }
+
+    // Vertical pass over the box only: just the output rows inside the box are resized, from
+    // the matching source rows at the same scale. An integer left edge and unchanged width
+    // make `fast_image_resize` skip its horizontal pass.
+    let box_w = x_end - x_start + 1;
+    let box_h = y_end - y_start + 1;
+    let row_scale = f64::from(crop_h.max(1.0).min(mh as f32)) / f64::from(oh);
+    let mut cols = Image::new(box_w as u32, box_h as u32, PixelType::F32);
+    let options = ResizeOptions::new().resize_alg(resize_alg).crop(
+        x_start as f64,
+        (y_start as f64).mul_add(row_scale, f64::from(crop_y.max(0.0))),
+        box_w as f64,
+        box_h as f64 * row_scale,
+    );
+    if resizer.resize(&rows, &mut cols, &options).is_err() {
+        return;
+    }
+
+    let cols_slice: &[f32] = bytemuck::cast_slice(cols.buffer());
+    let src =
+        ArrayView2::from_shape((box_h, box_w), cols_slice).expect("resized buffer is box_h*box_w");
+    mask_out
+        .slice_mut(s![y_start..=y_end, x_start..=x_end])
+        .assign(&src);
+}
+
+/// Combine per-detection mask coefficients with the prototype masks, then crop/resize each
+/// to the original image size. Shared by the standard and end2end segment post-processors.
+///
+/// `protos_data` is the flat `[num_masks, mh, mw]` prototype output; `mask_coeffs` is
+/// `[N, num_masks]` and `boxes_data` `[N, ..]` (both indexed by kept detection). Returns
+/// `None` (skip masks) when `protos_data` cannot reshape to `(num_masks, mh*mw)`.
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+fn build_instance_masks(
+    mask_coeffs: &Array2<f32>,
+    protos_data: &[f32],
+    num_masks: usize,
+    mh: usize,
+    mw: usize,
+    boxes_data: &Array2<f32>,
+    preprocess: &PreprocessResult,
+    inference_shape: (u32, u32),
+) -> Option<Array3<f32>> {
+    // Protos: [1, num_masks, mh, mw] -> [num_masks, mh*mw]
+    let protos = match ArrayView2::from_shape((num_masks, mh * mw), protos_data) {
+        Ok(view) => view,
+        Err(e) => {
+            crate::warn!("Failed to build protos array: {e}. Skipping mask generation.");
+            return None;
+        }
+    };
+    // Matrix mul: [N, num_masks] x [num_masks, mh*mw] -> [N, mh*mw]
+    let masks_flat = mask_coeffs.dot(&protos);
+
+    // Crop parameters (same for all masks): strip letterbox padding in proto space.
+    let (oh, ow) = preprocess.orig_shape;
+    let (th, tw) = inference_shape;
+    let (pad_top, pad_left) = preprocess.padding;
+    let scale_w = mw as f32 / tw as f32;
+    let scale_h = mh as f32 / th as f32;
+    let crop_x = pad_left * scale_w;
+    let crop_y = pad_top * scale_h;
+    let crop_w = 2.0f32.mul_add(-crop_x, mw as f32);
+    let crop_h = 2.0f32.mul_add(-crop_y, mh as f32);
+
+    let mut masks_data = Array3::zeros((boxes_data.nrows(), oh as usize, ow as usize));
+    let zip = Zip::from(masks_data.outer_iter_mut())
+        .and(masks_flat.outer_iter())
+        .and(boxes_data.outer_iter());
+    let apply = |mask_out, mask_flat: ArrayView1<f32>, box_data: ArrayView1<f32>| {
+        apply_mask_proto(
+            mask_out, &mask_flat, &box_data, mw, mh, ow, oh, crop_x, crop_y, crop_w, crop_h,
+        );
+    };
+    // rayon on native, sequential on wasm (no threads); see `crate::parallel`.
+    #[cfg(not(target_arch = "wasm32"))]
+    zip.par_for_each(apply);
+    #[cfg(target_arch = "wasm32")]
+    zip.for_each(apply);
+
+    Some(masks_data)
+}
+
+/// Post-process segmentation model output.
+///
+/// Generates bounding boxes and segmentation masks from the model output.
+///
+/// # Arguments
+///
+/// * `outputs` - Vector of model outputs (detection features and mask prototypes).
+/// * `preprocess` - Preprocessing metadata.
+/// * `config` - Inference configuration.
+/// * `results` - Pre-built results container to fill in.
+///
+/// # Returns
+///
+/// `Results` struct containing boxes and masks.
+#[allow(
+    clippy::similar_names,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    clippy::manual_let_else,
+    clippy::cast_possible_truncation
+)]
+fn postprocess_segment(
+    outputs: Vec<(&[f32], Vec<usize>)>,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+) -> Results {
+    let nc = results.names.len();
+    let inference_shape = results.inference_shape();
+
+    if outputs.len() < 2 {
+        // Protos output missing - log warning for user visibility
+        crate::warn!(
+            "Segmentation model missing protos output (expected 2 outputs, got {}). Returning empty masks.",
+            outputs.len()
+        );
+        return results;
+    }
+
+    let (output0, shape0) = &outputs[0];
+    let (output1, shape1) = &outputs[1];
+
+    // output0: [1, 4 + nc + nm, 8400]
+    // output1: [1, nm, 160, 160] (protos)
+
+    // Derive nm from the protos tensor so non-default prototype counts work correctly.
+    let num_masks = if shape1.len() == 4 { shape1[1] } else { 32 };
+    let expected_features = 4 + nc + num_masks;
+
+    let (num_preds, is_transposed) =
+        parse_transposed_shape(shape0, expected_features, expected_features);
+
+    if output0.is_empty() || num_preds == 0 {
+        return results;
+    }
+
+    // Convert to 2D [preds, features]. `output_to_2d` yields an empty array when the feature
+    // count disagrees with the buffer, which `decode_row` cannot index.
+    let output_2d = output_to_2d(output0, num_preds, expected_features, is_transposed);
+
+    if output_2d.is_empty() {
+        return results;
+    }
+
+    // Filter and NMS. The original row index is kept to look the coefficients up later.
+    let candidates: Vec<([f32; 4], f32, usize, usize)> = (0..num_preds)
+        .filter_map(|i| {
+            decode_row(&output_2d, i, nc, preprocess, config)
+                .map(|(bbox, score, class)| (bbox, score, class, i))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return results;
+    }
+
+    // Prepare candidates for NMS (bbox, score, class)
+    let keep_indices = nms_keep_indices(&candidates, config.iou_threshold, config.max_det);
+    let num_kept = keep_indices.len();
+
+    let mut boxes_data = Array2::zeros((num_kept, 6));
+    let mut mask_coeffs = Array2::zeros((num_kept, num_masks));
+
+    for (out_idx, &keep_idx) in keep_indices.iter().enumerate() {
+        let (bbox, score, class, orig_idx) = &candidates[keep_idx];
+        write_box_row(&mut boxes_data, out_idx, bbox, *score, *class);
+
+        // Extract coefficients: [orig_idx, 4+nc..]
+        let start = 4 + nc;
+        let coeffs = output_2d.slice(s![*orig_idx, start..start + num_masks]);
+        for m in 0..num_masks {
+            mask_coeffs[[out_idx, m]] = coeffs[m];
+        }
+    }
+
+    // Protos: [1, 32, 160, 160] -> [32, 25600]
+    // Validate protos shape before indexing to prevent panic
+    if shape1.len() < 4 {
+        crate::warn!(
+            "Protos output has unexpected shape (expected 4 dims, got {}). Skipping mask generation.",
+            shape1.len()
+        );
+        results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+        return results;
+    }
+    let mh = shape1[2];
+    let mw = shape1[3];
+
+    // Validate expected mask dimensions match
+    if shape1[1] != num_masks {
+        crate::warn!(
+            "Protos output has {} mask channels, expected {}. Mask quality may be affected.",
+            shape1[1],
+            num_masks
+        );
+    }
+
+    let masks_data = build_instance_masks(
+        &mask_coeffs,
+        output1,
+        num_masks,
+        mh,
+        mw,
+        &boxes_data,
+        preprocess,
+        inference_shape,
+    );
+    results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+    if let Some(masks_data) = masks_data {
+        results.masks = Some(Masks::new(masks_data, preprocess.orig_shape));
+    }
+
+    results
+}
+
+/// Derive `(num_preds, is_transposed)` from a pose/OBB output shape.
+///
+/// A `[1, features, preds]` layout is detected when the feature axis equals
+/// `expected_features`, or is the smaller axis while still holding at least
+/// `min_transposed_features` (pose passes `4 + kpt_features`, OBB passes `6`); otherwise
+/// the output is treated as the transposed `[1, preds, features]`. 2D shapes pick the
+/// larger axis as the prediction count; anything else yields `(0, false)`.
+const fn parse_transposed_shape(
+    shape: &[usize],
+    expected_features: usize,
+    min_transposed_features: usize,
+) -> (usize, bool) {
+    if shape.len() == 3 {
+        let (a, b) = (shape[1], shape[2]);
+        if a == expected_features || (a < b && a >= min_transposed_features) {
+            (b, false) // [1, features, preds]
+        } else {
+            (a, true) // [1, preds, features]
+        }
+    } else if shape.len() == 2 {
+        let (a, b) = (shape[0], shape[1]);
+        if a < b { (b, false) } else { (a, true) }
+    } else {
+        (0, false)
+    }
+}
+
+/// Post-process pose model output into boxes plus `num_keypoints` keypoints per detection.
+///
+/// Handles both `[1, features, preds]` and `[1, preds, features]` layouts, applies NMS, and
+/// scales boxes and keypoints back to the original image with the letterbox metadata.
+///
+/// `num_keypoints` and `kpt_dim` come from the model's `kpt_shape` metadata, so non-COCO
+/// keypoint counts and 2-channel (no visibility) exports decode correctly.
+#[allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::type_complexity,
+    clippy::cast_precision_loss,
+    clippy::doc_lazy_continuation
+)]
+fn postprocess_pose(
+    output: &[f32],
+    output_shape: &[usize],
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+    num_keypoints: usize,
+    kpt_dim: usize,
+) -> Results {
+    // `Keypoints` stores either `(N, K, 2)` or `(N, K, 3)`, so a wider layout has nowhere to
+    // put its remaining channels.
+    if num_keypoints == 0 || !(2..=3).contains(&kpt_dim) {
+        return results;
+    }
+
+    let num_classes = results.names.len().max(1);
+
+    // Keypoint layout comes from the model's `kpt_shape` metadata: COCO pose is (17, 3), but
+    // custom models use other counts, and `kpt_dim` is 2 when the export carries no visibility.
+    let kpt_features = num_keypoints * kpt_dim;
+
+    // Pose typically has 1 class (person), so COCO features = 4 + 1 + 51 = 56
+    let expected_features = 4 + num_classes + kpt_features;
+
+    // Parse output shape ([1, features, preds] vs transposed [1, preds, features]).
+    let (num_preds, is_transposed) =
+        parse_transposed_shape(output_shape, expected_features, 4 + kpt_features);
+
+    if output.is_empty() || num_preds == 0 {
+        return results;
+    }
+
+    // The head width has to agree with the metadata. Deriving a replacement class count from
+    // the surplus instead would read keypoint columns as class scores: a `[1, 68, N]` head with
+    // `kpt_shape (17, 3)` and one class would decode as 13 classes with keypoints starting at
+    // offset 17, which looks plausible and is entirely wrong.
+    let actual_features = output.len() / num_preds;
+    if actual_features != expected_features {
+        crate::warn!(
+            "Pose head width {actual_features} disagrees with the model metadata (expected {expected_features} for {num_classes} classes and kpt_shape ({num_keypoints}, {kpt_dim})). Returning empty results."
+        );
+        return results;
+    }
+
+    // Convert to 2D [preds, features]
+    let output_2d = output_to_2d(output, num_preds, expected_features, is_transposed);
+
+    if output_2d.is_empty() {
+        return results;
+    }
+
+    // Filter and NMS. The original row index is kept to decode keypoints for kept rows only.
+    let candidates: Vec<([f32; 4], f32, usize, usize)> = (0..num_preds)
+        .filter_map(|i| {
+            decode_row(&output_2d, i, num_classes, preprocess, config)
+                .map(|(bbox, score, class)| (bbox, score, class, i))
+        })
+        .collect();
+
+    let keep_indices = nms_keep_indices(&candidates, config.iou_threshold, config.max_det);
+    let num_kept = keep_indices.len();
+
+    let mut boxes_data = Array2::zeros((num_kept, 6));
+    let mut flat_kpts: Vec<f32> = Vec::with_capacity(num_kept * kpt_features);
+    let kpt_start = 4 + num_classes;
+
+    for (out_idx, &keep_idx) in keep_indices.iter().enumerate() {
+        let (bbox, score, class, row) = &candidates[keep_idx];
+        write_box_row(&mut boxes_data, out_idx, bbox, *score, *class);
+        push_keypoints(
+            &output_2d.slice(s![*row, kpt_start..]),
+            num_keypoints,
+            kpt_dim,
+            preprocess,
+            &mut flat_kpts,
+        );
+    }
+
+    let keypoints_data = Array3::from_shape_vec((num_kept, num_keypoints, kpt_dim), flat_kpts)
+        .expect("flat length matches (n, nk, kpt_dim)");
+    // An empty keypoints tensor is still emitted when nothing is kept.
+    results.keypoints = Some(Keypoints::new(keypoints_data, preprocess.orig_shape));
+    if num_kept > 0 {
+        results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+    }
+    results
+}
+
+/// Post-process classification model output.
+///
+/// Computes best class predictions and probabilities.
+///
+/// # Arguments
+///
+/// * `output` - Raw model output vector.
+/// * `results` - Pre-built results container to fill in.
+///
+/// # Returns
+///
+/// `Results` struct containing classification probabilities.
+fn postprocess_classify(output: &[f32], mut results: Results) -> Results {
+    if output.is_empty() {
+        return results;
+    }
+
+    // Probs::new expects an Array1, which we can create from the slice
+    let mut probs_vec = output.to_vec();
+
+    // Treat the head as already-normalized only when it actually looks like a distribution:
+    // every value within `0..=1` and summing to about 1. Gating on `sum > 0.0` instead let a
+    // vector of negative logits through untouched, so raw logits were stored as probabilities
+    // and `top1conf` could report a negative confidence.
+    let sum: f32 = probs_vec.iter().sum();
+    let is_distribution =
+        (sum - 1.0).abs() <= 0.1 && probs_vec.iter().all(|&v| (0.0..=1.0).contains(&v));
+    if !is_distribution {
+        // Apply softmax normalization
+        let max_val = probs_vec.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_vals: Vec<f32> = probs_vec.iter().map(|&v| (v - max_val).exp()).collect();
+        let exp_sum: f32 = exp_vals.iter().sum();
+        if exp_sum > 0.0 {
+            probs_vec = exp_vals.iter().map(|&v| v / exp_sum).collect();
+        }
+    }
+
+    let probs = ndarray::Array1::from_vec(probs_vec);
+    results.probs = Some(Probs::new(probs));
+
+    results
+}
+
+/// Post-process OBB (oriented bounding box) model output.
+///
+/// Extracts oriented bounding boxes with rotation angle.
+///
+/// # Arguments
+///
+/// * `output` - Model output data.
+/// * `output_shape` - Output tensor shape.
+/// * `preprocess` - Preprocessing metadata.
+/// * `config` - Inference configuration.
+/// * `results` - Pre-built results container to fill in.
+///
+/// # Returns
+///
+/// `Results` struct containing oriented bounding boxes.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn postprocess_obb(
+    output: &[f32],
+    output_shape: &[usize],
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+) -> Results {
+    let num_classes = results.names.len().max(1);
+
+    // OBB format: [xywh, class_scores..., rotation_angle]
+    // features = 4 (bbox) + num_classes + 1 (angle)
+    let expected_features = 4 + num_classes + 1;
+
+    // Parse output shape ([1, features, preds] vs transposed [1, preds, features]).
+    let (num_preds, is_transposed) = parse_transposed_shape(output_shape, expected_features, 6);
+
+    if output.is_empty() || num_preds == 0 {
+        return results;
+    }
+
+    // Infer actual feature count from data
+    let actual_features = output.len() / num_preds;
+    if actual_features < 6 {
+        crate::warn!(
+            "OBB model has insufficient features ({actual_features}), expected at least 6"
+        );
+        return results;
+    }
+
+    // Convert to 2D [preds, features]
+    let output_2d = output_to_2d(output, num_preds, actual_features, is_transposed);
+
+    if output_2d.is_empty() {
+        return results;
+    }
+
+    // Derive number of classes from features: features = 4 + nc + 1
+    let derived_classes = actual_features.saturating_sub(5); // 4 bbox + 1 angle
+    let num_classes = derived_classes.max(1);
+
+    // Filter and NMS - store candidates with angle
+    // [cx, cy, w, h, angle], conf, class
+    let mut candidates: Vec<([f32; 5], f32, usize)> = Vec::with_capacity(256);
+
+    for i in 0..num_preds {
+        // Get class scores
+        let class_scores = output_2d.slice(s![i, 4..4 + num_classes]);
+        let (best_class, best_score) = best_class_score(&class_scores);
+
+        if best_score < config.confidence_threshold {
+            continue;
+        }
+
+        // Extract OBB: xywh + rotation
+        let cx = output_2d[[i, 0]];
+        let cy = output_2d[[i, 1]];
+        let w = output_2d[[i, 2]];
+        let h = output_2d[[i, 3]];
+        let angle = output_2d[[i, 4 + num_classes]]; // Last value is rotation angle (radians)
+
+        // Scale center to original image space and clip to bounds.
+        let (clipped_cx, clipped_cy) = scale_keypoint(cx, cy, preprocess);
+
+        // Scale width and height (note: don't apply padding, just scale)
+        let scaled_w = w / preprocess.scale.1;
+        let scaled_h = h / preprocess.scale.0;
+
+        // Filter by class if specified
+        if !config.keep_class(best_class) {
+            continue;
+        }
+
+        candidates.push((
+            [clipped_cx, clipped_cy, scaled_w, scaled_h, angle],
+            best_score,
+            best_class,
+        ));
+    }
+
+    if candidates.is_empty() {
+        results.obb = Some(Obb::new(Array2::zeros((0, 7)), preprocess.orig_shape));
+        return results;
+    }
+
+    // Apply Rotated NMS for precise suppression using ProbIoU (Hellinger distance).
+    // This ensures that overlapping rotated boxes are correctly filtered based on their
+    // actual geometric overlap, which standard axis-aligned IoU cannot handle.
+    let keep_indices =
+        nms_rotated_per_class_capped(&candidates, config.iou_threshold, config.max_det);
+    let num_kept = keep_indices.len();
+
+    // Build output array: [cx, cy, w, h, rotation, conf, cls]
+    let mut obb_data = Array2::zeros((num_kept, 7));
+
+    for (out_idx, &keep_idx) in keep_indices.iter().take(num_kept).enumerate() {
+        let (xywhr, score, class) = &candidates[keep_idx];
+        obb_data[[out_idx, 0]] = xywhr[0]; // cx
+        obb_data[[out_idx, 1]] = xywhr[1]; // cy
+        obb_data[[out_idx, 2]] = xywhr[2]; // w
+        obb_data[[out_idx, 3]] = xywhr[3]; // h
+        obb_data[[out_idx, 4]] = xywhr[4]; // rotation (radians)
+        obb_data[[out_idx, 5]] = *score;
+        #[allow(clippy::cast_precision_loss)]
+        let class_f32 = *class as f32;
+        obb_data[[out_idx, 6]] = class_f32;
+    }
+
+    results.obb = Some(Obb::new(obb_data, preprocess.orig_shape));
+
+    results
+}
+
+// Postprocessing for the YOLO26 NMS-free one-to-one head (`nms=False`) and
+// exports with NMS baked into the graph (`nms=True`).
+//
+// Both produce a tensor of shape
+// `[B, max_det, 6 + extra]`, where the first 6 columns are always
+// `[x1, y1, x2, y2, conf, cls]` (OBB is the exception; see `postprocess_obb_end2end`).
+// Coordinates are in the letterboxed model-input space, so we still scale/pad-correct
+// them back to original-image space. No NMS, no class-score matrix.
+
+/// Walk a sorted end-to-end output and, for each row above the confidence threshold that
+/// passes the class filter, scale/clip its box and invoke `on_kept(base, [x1,y1,x2,y2],
+/// conf, cls)`. Rows are confidence-descending, so it stops at the first sub-threshold row
+/// and after `cap` kept detections — the shared box-decode of the detect/segment/pose paths.
+///
+/// `normalized_to` names the inference `(height, width)` for heads whose first four columns
+/// are `[cx, cy, w, h]` normalized to the input, as RT-DETR's are; `None` reads them as the
+/// absolute `[x1, y1, x2, y2]` the YOLO end-to-end heads emit.
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+fn decode_end2end(
+    output: &[f32],
+    num_preds: usize,
+    feats: usize,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    cap: usize,
+    normalized_to: Option<(u32, u32)>,
+    mut on_kept: impl FnMut(usize, [f32; 4], f32, usize),
+) {
+    // Stopping at the first sub-threshold row is only sound because every head feeding this
+    // walk emits confidence-descending rows: the YOLO end-to-end and RT-DETR graphs both end
+    // in `TopK(sorted=1)`. Assert it in debug so a head that ever stops sorting trips here
+    // instead of silently dropping the detections behind the first low-scoring row.
+    debug_assert!(
+        (1..num_preds).all(|i| output[i * feats + 4] <= output[(i - 1) * feats + 4]),
+        "decode_end2end expects confidence-descending rows"
+    );
+    let mut kept = 0;
+    for i in 0..num_preds {
+        let base = i * feats;
+        let conf = output[base + 4];
+        if conf < config.confidence_threshold {
+            break;
+        }
+        let cls = output[base + 5] as usize;
+        if !config.keep_class(cls) {
+            continue;
+        }
+        let corners = match normalized_to {
+            Some((h, w)) => xywh_to_xyxy(
+                output[base] * w as f32,
+                output[base + 1] * h as f32,
+                output[base + 2] * w as f32,
+                output[base + 3] * h as f32,
+            ),
+            None => [
+                output[base],
+                output[base + 1],
+                output[base + 2],
+                output[base + 3],
+            ],
+        };
+        let bbox = scale_and_clip_box(&corners, preprocess);
+        on_kept(base, bbox, conf, cls);
+        kept += 1;
+        if kept >= cap {
+            break;
+        }
+    }
+}
+
+/// Post-process YOLO26 end-to-end detection output `[1, max_det, 6]`.
+#[allow(clippy::cast_precision_loss)]
+fn postprocess_detect_end2end(
+    output: &[f32],
+    output_shape: &[usize],
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+    normalized_to: Option<(u32, u32)>,
+) -> Results {
+    if output_shape.len() != 3 || output.is_empty() {
+        return results;
+    }
+    let max_det = output_shape[1];
+    let feats = output_shape[2];
+    if feats < 6 || max_det == 0 {
+        return results;
+    }
+
+    let user_cap = config.max_det.min(max_det);
+
+    let mut flat: Vec<f32> = Vec::with_capacity(user_cap * 6);
+    decode_end2end(
+        output,
+        max_det,
+        feats,
+        preprocess,
+        config,
+        user_cap,
+        normalized_to,
+        |_base, bbox, conf, cls| {
+            flat.extend_from_slice(&[bbox[0], bbox[1], bbox[2], bbox[3], conf, cls as f32]);
+        },
+    );
+
+    let n = flat.len() / 6;
+    if n > 0 {
+        let boxes_data = Array2::from_shape_vec((n, 6), flat).expect("flat length matches (n, 6)");
+        results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+    }
+    results
+}
+
+/// Post-process YOLO26 end-to-end segmentation output.
+///
+/// `output0`: `[1, max_det, 6 + nm]`, `output1`: `[1, nm, mh, mw]` (protos).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    clippy::manual_let_else
+)]
+fn postprocess_segment_end2end(
+    outputs: Vec<(&[f32], Vec<usize>)>,
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+) -> Results {
+    let inference_shape = results.inference_shape();
+    if outputs.len() < 2 {
+        crate::warn!(
+            "End2end segmentation missing protos output (got {} outputs).",
+            outputs.len()
+        );
+        return results;
+    }
+    let (output0, shape0) = &outputs[0];
+    let (output1, shape1) = &outputs[1];
+
+    if shape0.len() != 3 || shape1.len() != 4 {
+        return results;
+    }
+    let max_det = shape0[1];
+    let feats = shape0[2];
+    let num_masks = shape1[1];
+    if feats < 6 + num_masks {
+        crate::warn!("End2end segment features ({feats}) < 6 + num_masks ({num_masks}).");
+        return results;
+    }
+
+    let user_cap = config.max_det.min(max_det);
+
+    let mut flat_boxes: Vec<f32> = Vec::with_capacity(user_cap * 6);
+    let mut flat_coeffs: Vec<f32> = Vec::with_capacity(user_cap * num_masks);
+
+    decode_end2end(
+        output0,
+        max_det,
+        feats,
+        preprocess,
+        config,
+        user_cap,
+        None,
+        |base, bbox, conf, cls| {
+            flat_boxes.extend_from_slice(&[bbox[0], bbox[1], bbox[2], bbox[3], conf, cls as f32]);
+            let coeff_start = base + 6;
+            flat_coeffs.extend_from_slice(&output0[coeff_start..coeff_start + num_masks]);
+        },
+    );
+
+    let num_kept = flat_boxes.len() / 6;
+    if num_kept == 0 {
+        return results;
+    }
+
+    let boxes_data =
+        Array2::from_shape_vec((num_kept, 6), flat_boxes).expect("flat length matches (n, 6)");
+    let mask_coeffs = Array2::from_shape_vec((num_kept, num_masks), flat_coeffs)
+        .expect("flat length matches (n, num_masks)");
+
+    // Protos -> masks (mirrors standard segment path).
+    let (mh, mw) = (shape1[2], shape1[3]);
+    let Some(masks_data) = build_instance_masks(
+        &mask_coeffs,
+        output1,
+        num_masks,
+        mh,
+        mw,
+        &boxes_data,
+        preprocess,
+        inference_shape,
+    ) else {
+        return results;
+    };
+
+    results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+    results.masks = Some(Masks::new(masks_data, preprocess.orig_shape));
+    results
+}
+
+/// Post-process YOLO26 end-to-end pose output `[1, max_det, 6 + nk*kpt_dim]`.
+#[allow(clippy::cast_precision_loss, clippy::similar_names)]
+fn postprocess_pose_end2end(
+    output: &[f32],
+    output_shape: &[usize],
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+    nk: usize,
+    kpt_dim: usize,
+) -> Results {
+    if output_shape.len() != 3 || output.is_empty() || nk == 0 || !(2..=3).contains(&kpt_dim) {
+        return results;
+    }
+    let max_det = output_shape[1];
+    let feats = output_shape[2];
+    if feats < 6 + nk * kpt_dim || max_det == 0 {
+        return results;
+    }
+
+    let user_cap = config.max_det.min(max_det);
+
+    let mut flat_boxes: Vec<f32> = Vec::with_capacity(user_cap * 6);
+    let mut flat_kpts: Vec<f32> = Vec::with_capacity(user_cap * nk * kpt_dim);
+
+    decode_end2end(
+        output,
+        max_det,
+        feats,
+        preprocess,
+        config,
+        user_cap,
+        None,
+        |base, bbox, conf, cls| {
+            flat_boxes.extend_from_slice(&[bbox[0], bbox[1], bbox[2], bbox[3], conf, cls as f32]);
+            push_keypoints(
+                &ArrayView1::from(&output[base + 6..]),
+                nk,
+                kpt_dim,
+                preprocess,
+                &mut flat_kpts,
+            );
+        },
+    );
+
+    let n = flat_boxes.len() / 6;
+    // Always emit a keypoints tensor (even empty) to match the non-end2end pose path.
+    let kdata = Array3::from_shape_vec((n, nk, kpt_dim), flat_kpts)
+        .expect("flat length matches (n, nk, kpt_dim)");
+    results.keypoints = Some(Keypoints::new(kdata, preprocess.orig_shape));
+    if n > 0 {
+        let boxes_data =
+            Array2::from_shape_vec((n, 6), flat_boxes).expect("flat length matches (n, 6)");
+        results.boxes = Some(Boxes::new(boxes_data, preprocess.orig_shape));
+    }
+    results
+}
+
+/// Post-process YOLO26 end-to-end OBB output `[1, max_det, 7]`
+/// with layout `[cx, cy, w, h, conf, cls, angle]`.
+#[allow(clippy::cast_precision_loss)]
+fn postprocess_obb_end2end(
+    output: &[f32],
+    output_shape: &[usize],
+    preprocess: &PreprocessResult,
+    config: &InferenceConfig,
+    mut results: Results,
+) -> Results {
+    let mut flat: Vec<f32> = Vec::new();
+
+    if output_shape.len() == 3 && !output.is_empty() {
+        let max_det = output_shape[1];
+        let feats = output_shape[2];
+        if feats >= 7 && max_det > 0 {
+            let (scale_y, scale_x) = preprocess.scale;
+            let user_cap = config.max_det.min(max_det);
+            flat.reserve(user_cap * 7);
+
+            // The shared decoder's xyxy box is unused here: OBB keeps `xywhr`, so the raw
+            // row is rescaled below and the rotation angle is read from column 6.
+            decode_end2end(
+                output,
+                max_det,
+                feats,
+                preprocess,
+                config,
+                user_cap,
+                None,
+                |base, _bbox, conf, cls| {
+                    let (cx, cy) = scale_keypoint(output[base], output[base + 1], preprocess);
+                    flat.extend_from_slice(&[
+                        cx,
+                        cy,
+                        output[base + 2] / scale_x,
+                        output[base + 3] / scale_y,
+                        output[base + 6],
+                        conf,
+                        cls as f32,
+                    ]);
+                },
+            );
+        }
+    }
+
+    let n = flat.len() / 7;
+    let obb_data = Array2::from_shape_vec((n, 7), flat).expect("flat length matches (n, 7)");
+    results.obb = Some(Obb::new(obb_data, preprocess.orig_shape));
+    results
+}
+
+/// Attach a row-major `oh x ow` class map to `results` as its semantic mask.
+#[allow(clippy::cast_possible_truncation)]
+fn finish_semantic_mask(mut results: Results, buf: Vec<u16>, oh: usize, ow: usize) -> Results {
+    let class_map = Array2::from_shape_vec((oh, ow), buf).expect("shape matches");
+    results.semantic_mask = Some(SemanticMask::new(class_map, (oh as u32, ow as u32)));
+    results
+}
+
+/// Compute the centered-letterbox crop bounds in model-output (lh, lw) space that
+/// cover the original image (oh, ow).
+///
+/// Returns `(top, left, crop_h, crop_w)` or `None` if the crop is empty (degenerate input).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names
+)]
+fn letterbox_crop_bounds(
+    lh: usize,
+    lw: usize,
+    oh: usize,
+    ow: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let gain = (lh as f32 / oh as f32).min(lw as f32 / ow as f32);
+    let pad_h_half = (lh as f32 - (oh as f32 * gain).round()) / 2.0;
+    let pad_w_half = (lw as f32 - (ow as f32 * gain).round()) / 2.0;
+    let top = (pad_h_half - 0.1).round().max(0.0) as usize;
+    let left = (pad_w_half - 0.1).round().max(0.0) as usize;
+    let bottom = lh.saturating_sub((pad_h_half + 0.1).round() as usize);
+    let right = lw.saturating_sub((pad_w_half + 0.1).round() as usize);
+    let crop_h = bottom.saturating_sub(top);
+    let crop_w = right.saturating_sub(left);
+    if crop_h == 0 || crop_w == 0 {
+        None
+    } else {
+        Some((top, left, crop_h, crop_w))
+    }
+}
+
+/// Map an output index `d` to its two source neighbors `(i0, i1)` and fractional weight
+/// `frac` for bilinear upsampling of a letterbox-cropped axis. `offset` is the crop start
+/// and `max_idx` the last valid source index. Uses the `(d + 0.5) * scale - 0.5` half-pixel
+/// convention of Python's `align_corners=False` `F.interpolate`.
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn bilinear_axis(d: usize, scale: f32, offset: usize, max_idx: usize) -> (usize, usize, f32) {
+    let s = (d as f32 + 0.5).mul_add(scale, -0.5).max(0.0) + offset as f32;
+    let i0 = (s.floor() as usize).min(max_idx);
+    let i1 = (i0 + 1).min(max_idx);
+    (i0, i1, s - i0 as f32)
+}
+
+/// Precompute per-output-column bilinear source neighbors and weights `(x0, x1, w0, w1)`
+/// for upsampling a `crop_w`-wide letterbox-cropped region (starting at `left`) to `ow` columns.
+#[allow(clippy::cast_precision_loss)]
+fn bilinear_x_lut(
+    ow: usize,
+    lw: usize,
+    left: usize,
+    crop_w: usize,
+) -> Vec<(usize, usize, f32, f32)> {
+    let scale_x = crop_w as f32 / ow as f32;
+    let lw_minus_1 = lw.saturating_sub(1);
+    (0..ow)
+        .map(|dx| {
+            let (x0, x1, fx) = bilinear_axis(dx, scale_x, left, lw_minus_1);
+            (x0, x1, 1.0 - fx, fx)
+        })
+        .collect()
+}
+
+/// Post-process a Semantic Segmentation ONNX that has ArgMax + Cast(uint8) baked in.
+///
+/// Output shape is `[1, lh, lw] uint8`. For cityscapes-style inputs where the model's
+/// native rect shape matches the source image (lh==oh && lw==ow), this is a single memcpy
+/// into the class map. For other aspect ratios we crop the centered letterbox padding
+/// and nearest-neighbour upsample to original image shape.
+///
+/// # Panics
+///
+/// Panics if the freshly-allocated `Array2<u16>` class map is not contiguous (cannot occur
+/// for `Array2::zeros` on standard layout).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names,
+    clippy::implicit_hasher
+)]
+#[must_use]
+pub fn postprocess_semantic_mask(
+    output: &[u8],
+    shape: &[usize],
+    names: Arc<HashMap<usize, String>>,
+    orig_img: Array3<u8>,
+    path: String,
+    speed: Speed,
+    inference_shape: (u32, u32),
+) -> Results {
+    let oh = orig_img.shape()[0];
+    let ow = orig_img.shape()[1];
+    let results = Results::new(orig_img, path, names, speed, inference_shape);
+
+    if shape.len() < 2 || output.is_empty() {
+        return results;
+    }
+    let (lh, lw) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    if lh == 0 || lw == 0 || oh == 0 || ow == 0 {
+        return results;
+    }
+
+    // Model output already at original resolution: just widen u8 -> u16.
+    if lh == oh && lw == ow {
+        let mut buf = vec![0u16; oh * ow];
+        for (dst, &src) in buf.iter_mut().zip(output.iter()) {
+            *dst = u16::from(src);
+        }
+        return finish_semantic_mask(results, buf, oh, ow);
+    }
+
+    // Slow path: crop centered letterbox padding in semantic-mask space, then NN upsample.
+    let Some((top, left, crop_h, crop_w)) = letterbox_crop_bounds(lh, lw, oh, ow) else {
+        return results;
+    };
+
+    let scale_y = crop_h as f32 / oh as f32;
+    let scale_x = crop_w as f32 / ow as f32;
+    let crop_h_minus_1 = crop_h.saturating_sub(1);
+    let crop_w_minus_1 = crop_w.saturating_sub(1);
+    let x_lut: Vec<usize> = (0..ow)
+        .map(|dx| ((dx as f32 + 0.5) * scale_x) as usize)
+        .map(|sx| sx.min(crop_w_minus_1) + left)
+        .collect();
+
+    let mut buf = vec![0u16; oh * ow];
+    buf.par_chunks_mut(ow).enumerate().for_each(|(dy, row)| {
+        let sy = (((dy as f32 + 0.5) * scale_y) as usize).min(crop_h_minus_1) + top;
+        let src_row_base = sy * lw;
+        for (dx, cell) in row.iter_mut().enumerate() {
+            *cell = u16::from(output[src_row_base + x_lut[dx]]);
+        }
+    });
+    finish_semantic_mask(results, buf, oh, ow)
+}
+
+/// Post-process a monocular depth model output into a per-pixel depth map (meters).
+///
+/// The exported ONNX output is `[1, 1, lh, lw]` (or `[1, lh, lw]`) float32 with all
+/// activation and calibration baked into the graph, at the stretched input resolution.
+/// Depth inputs are scale-filled, so there is no padding to crop: the whole output is
+/// bilinear-resized (`align_corners=True`) to the original `(H, W)`, mirroring the Python
+/// `DepthPredictor`.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names
+)]
+fn postprocess_depth(output: &[f32], shape: &[usize], mut results: Results) -> Results {
+    let oh = results.orig_img.shape()[0];
+    let ow = results.orig_img.shape()[1];
+
+    if shape.len() < 2 || output.is_empty() {
+        return results;
+    }
+    let (lh, lw) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    if lh == 0 || lw == 0 || oh == 0 || ow == 0 || output.len() < lh * lw {
+        return results;
+    }
+
+    // Source coordinate of destination index `d`: corners map to corners. A single-pixel
+    // destination axis samples the source origin.
+    let axis = |d: usize, dst: usize, src: usize| {
+        let pos = if dst > 1 {
+            d as f32 * (src - 1) as f32 / (dst - 1) as f32
+        } else {
+            0.0
+        };
+        let i0 = (pos as usize).min(src - 1);
+        (i0, (i0 + 1).min(src - 1), pos - i0 as f32)
+    };
+    let x_lut: Vec<_> = (0..ow).map(|dx| axis(dx, ow, lw)).collect();
+
+    let mut buf = vec![0f32; oh * ow];
+    buf.par_chunks_mut(ow).enumerate().for_each(|(dy, row)| {
+        let (y0, y1, fy) = axis(dy, oh, lh);
+        let (row0, row1) = (y0 * lw, y1 * lw);
+        for (cell, &(x0, x1, fx)) in row.iter_mut().zip(&x_lut) {
+            let top_row = output[row0 + x0].mul_add(1.0 - fx, output[row0 + x1] * fx);
+            let bot_row = output[row1 + x0].mul_add(1.0 - fx, output[row1 + x1] * fx);
+            *cell = top_row.mul_add(1.0 - fy, bot_row * fy);
+        }
+    });
+    let map = Array2::from_shape_vec((oh, ow), buf).expect("shape matches");
+    results.depth = Some(DepthMap::new(map, (oh as u32, ow as u32)));
+    results
+}
+
+/// Post-process semantic segmentation model output.
+///
+/// The model outputs raw logits of shape `[1, nc, lh, lw]` at the P3 scale
+/// (stride 8). Pipeline:
+/// 1. Transpose CHW to HWC once (small: lh*lw*nc f32s) so per-pixel argmax is contiguous.
+/// 2. Bilinear-interpolate each output pixel's 4 source neighbors, fused with argmax
+///    over `nc` classes, producing the final class map in one pass.
+///
+/// Memory traffic per output pixel drops from 4*nc strided reads to 4*nc contiguous
+/// reads; the source channels for one source pixel fit in ~80 bytes (1-2 cache lines).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names
+)]
+fn postprocess_semantic(output: &[f32], shape: &[usize], results: Results) -> Results {
+    let oh = results.orig_img.shape()[0];
+    let ow = results.orig_img.shape()[1];
+
+    if shape.len() < 4 || output.is_empty() {
+        return results;
+    }
+
+    let nc = shape[1];
+    let lh = shape[2];
+    let lw = shape[3];
+
+    if nc == 0 || nc > usize::from(u16::MAX) + 1 || lh == 0 || lw == 0 || oh == 0 || ow == 0 {
+        return results;
+    }
+
+    // Model output is already at orig_img resolution (no resize, no padding).
+    // Avoids the CHW->HWC transpose and bilinear interpolation entirely: just argmax over
+    // the class channel for each pixel. Hits when the export bakes a full-res upsample
+    // into the ONNX graph and the input was the model's native rect shape.
+    if lh == oh && lw == ow {
+        let plane = lh * lw;
+        let mut buf = vec![0u16; oh * ow];
+        // Load one source row per class at a time so each row fits in cache.
+        // Scratch buffer shared across all rows a given thread processes; one allocation per thread.
+        buf.par_chunks_mut(ow).enumerate().for_each_with(
+            vec![0.0f32; lw],
+            |best_vals, (dy, row)| {
+                if nc == 1 {
+                    let src = &output[dy * lw..(dy + 1) * lw];
+                    for (cell, &v) in row.iter_mut().zip(src.iter()) {
+                        *cell = u16::from(v > 0.0);
+                    }
+                } else {
+                    // Seed best_vals with class 0; row is already zeroed (best_cls = 0).
+                    let src0 = &output[dy * lw..(dy + 1) * lw];
+                    best_vals.copy_from_slice(src0);
+                    for c in 1..nc {
+                        let src_c = &output[c * plane + dy * lw..c * plane + (dy + 1) * lw];
+                        for ((cell, best), &v) in
+                            row.iter_mut().zip(best_vals.iter_mut()).zip(src_c.iter())
+                        {
+                            if v > *best {
+                                *best = v;
+                                *cell = c as u16;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        return finish_semantic_mask(results, buf, oh, ow);
+    }
+
+    // Crop centered letterbox padding, then bilinear-upsample crop to (oh, ow).
+    let plane = lh * lw;
+    let Some((top, left, crop_h, crop_w)) = letterbox_crop_bounds(lh, lw, oh, ow) else {
+        return results;
+    };
+    let x_lut = bilinear_x_lut(ow, lw, left, crop_w);
+    let scale_y = crop_h as f32 / oh as f32;
+    let lh_minus_1 = lh.saturating_sub(1);
+
+    // Bilinear upsample and argmax directly on CHW data, skipping the transpose.
+    // Reads are strided (one plane apart per class) but avoids transposing 39M floats.
+    let mut buf = vec![0u16; oh * ow];
+    buf.par_chunks_mut(ow).enumerate().for_each(|(dy, row)| {
+        let (y0, y1, fy) = bilinear_axis(dy, scale_y, top, lh_minus_1);
+        let fyi = 1.0 - fy;
+
+        let row0_base = y0 * lw;
+        let row1_base = y1 * lw;
+
+        for (dx, cell) in row.iter_mut().enumerate() {
+            let (x0, x1, fxi, fx) = x_lut[dx];
+            let w00 = fyi * fxi;
+            let w10 = fy * fxi;
+            let w01 = fyi * fx;
+            let w11 = fy * fx;
+
+            // Interpolate class `c`'s logit from its four neighbors in that class's plane.
+            let logit = |c: usize| {
+                let base = c * plane;
+                output[base + row1_base + x1].mul_add(
+                    w11,
+                    output[base + row0_base + x1].mul_add(
+                        w01,
+                        output[base + row1_base + x0]
+                            .mul_add(w10, output[base + row0_base + x0] * w00),
+                    ),
+                )
+            };
+
+            *cell = if nc == 1 {
+                u16::from(logit(0) > 0.0)
+            } else {
+                let mut best_cls = 0u16;
+                let mut best_val = f32::NEG_INFINITY;
+                for c in 0..nc {
+                    let v = logit(c);
+                    if v > best_val {
+                        best_val = v;
+                        best_cls = c as u16;
+                    }
+                }
+                best_cls
+            };
+        }
+    });
+    finish_semantic_mask(results, buf, oh, ow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array1;
+
+    /// `apply_mask_proto` writes the box interior and nothing else, so the caller's zeroed
+    /// output stays zero outside it. Checks a plain box, one overhanging every edge, and a
+    /// degenerate one, against the `x1 <= x <= x2 && y1 <= y <= y2` rule it replaced.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_apply_mask_proto_writes_only_inside_the_box() {
+        let (mw, mh, ow, oh) = (8usize, 8usize, 8u32, 8u32);
+        // Large logits so every resized pixel sigmoids to ~1.0 and "written" is unambiguous.
+        let mask_flat = Array1::from_elem(mw * mh, 10.0f32);
+
+        for (label, bbox) in [
+            ("interior", [2.0f32, 3.0, 5.0, 6.0]),
+            ("overhangs every edge", [-4.0f32, -4.0, 99.0, 99.0]),
+            ("degenerate", [4.0f32, 6.0, 4.0, 2.0]),
+        ] {
+            let mut out = Array2::<f32>::zeros((oh as usize, ow as usize));
+            let bbox = Array1::from_vec(bbox.to_vec());
+            apply_mask_proto(
+                out.view_mut(),
+                &mask_flat.view(),
+                &bbox.view(),
+                mw,
+                mh,
+                ow,
+                oh,
+                0.0,
+                0.0,
+                mw as f32,
+                mh as f32,
+            );
+
+            let (x1, y1) = (bbox[0].max(0.0), bbox[1].max(0.0));
+            let (x2, y2) = (bbox[2].min(ow as f32), bbox[3].min(oh as f32));
+            for y in 0..oh as usize {
+                for x in 0..ow as usize {
+                    let inside = (x as f32) >= x1
+                        && (x as f32) <= x2
+                        && (y as f32) >= y1
+                        && (y as f32) <= y2;
+                    assert_eq!(
+                        out[[y, x]] > 0.5,
+                        inside,
+                        "{label}: pixel ({x}, {y}) = {}",
+                        out[[y, x]]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Class names `class0..class{nc-1}`.
+    fn make_names(nc: usize) -> Arc<HashMap<usize, String>> {
+        Arc::new((0..nc).map(|i| (i, format!("class{i}"))).collect())
+    }
+
+    /// Identity letterbox geometry (scale 1, no padding) for an `orig`-sized image.
+    /// The `Results` container the dispatcher hands to each post-processor: a zeroed
+    /// `orig`-sized image with `nc` class names, letterboxed to `inference_shape`.
+    fn results_for(nc: usize, orig: (usize, usize), inference_shape: (u32, u32)) -> Results {
+        Results::new(
+            ndarray::Array3::zeros((orig.0, orig.1, 3)),
+            String::new(),
+            make_names(nc),
+            Speed::default(),
+            inference_shape,
+        )
+    }
+
+    #[test]
+    fn test_parse_detect_shape() {
+        // (shape, expected_classes) -> (nc, num_preds, transposed). `expected_classes == 0`
+        // means the model had no metadata, so the class count is inferred as features - 4
+        // and the layout from which dimension is smaller.
+        type Case<'a> = (&'a [usize], usize, (usize, usize, bool));
+        let cases: &[Case<'_>] = &[
+            // 3D, with and without metadata, both layouts.
+            (&[1, 84, 8400], 80, (80, 8400, false)),
+            (&[1, 8400, 84], 80, (80, 8400, true)),
+            (&[1, 84, 8400], 0, (80, 8400, false)),
+            (&[1, 8400, 84], 0, (80, 8400, true)),
+            // 2D [features, preds] and its transpose.
+            (&[84, 8400], 80, (80, 8400, false)),
+            (&[84, 8400], 0, (80, 8400, false)),
+            (&[8400, 84], 0, (80, 8400, true)),
+        ];
+        for (shape, expected_classes, expected) in cases {
+            assert_eq!(
+                parse_detect_shape(shape, *expected_classes),
+                *expected,
+                "shape {shape:?}, expected_classes {expected_classes}"
+            );
+        }
+
+        // Degenerate dims and unsupported ranks yield zero predictions.
+        assert_eq!(parse_detect_shape(&[2, 3], 80).1, 0);
+        assert_eq!(parse_detect_shape(&[1, 2, 3, 4], 80).1, 0);
+    }
+
+    #[test]
+    fn test_infer_end2end_kpt_shape() {
+        // COCO pose: 17 kpts × 3 dims -> kpt_feats=51 (only div3) -> (17, 3)
+        assert_eq!(infer_end2end_kpt_shape(&[1, 300, 6 + 51]), Some((17, 3)));
+        // Pure 2D pose: 17 × 2 -> kpt_feats=34 (only div2) -> (17, 2)
+        assert_eq!(infer_end2end_kpt_shape(&[1, 300, 6 + 34]), Some((17, 2)));
+        // Ambiguous (divisible by 6): 12 × 3 vs 18 × 2 both decode to 36 -> None
+        assert_eq!(infer_end2end_kpt_shape(&[1, 300, 6 + 36]), None);
+        // Shape that isn't the end-to-end layout -> None
+        assert_eq!(infer_end2end_kpt_shape(&[1, 56, 8400]), None);
+        // shape[2] <= 6 -> None (no keypoint features)
+        assert_eq!(infer_end2end_kpt_shape(&[1, 300, 6]), None);
+    }
+
+    #[test]
+    fn test_empty_output() {
+        let output: Vec<f32> = vec![];
+        let results = postprocess_detect(
+            &output,
+            &[1, 84, 0],
+            &unit_preprocess((480, 640)),
+            &InferenceConfig::default(),
+            results_for(0, (480, 640), (640, 640)),
+        );
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_nan_scores_handled() {
+        // Test that NaN scores don't cause panic
+        let mut output: Vec<f32> = vec![0.0; 84]; // One prediction
+        // Set box coords
+        output[0] = 100.0; // cx
+        output[1] = 100.0; // cy
+        output[2] = 50.0; // w
+        output[3] = 50.0; // h
+        // Set class scores with NaN
+        output[4] = f32::NAN;
+        output[5] = 0.9; // This should be selected even with NaN present
+
+        // This should not panic
+        let results = postprocess_detect(
+            &output,
+            &[1, 84, 1],
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            results_for(2, (640, 640), (640, 640)),
+        );
+
+        // Test passed if we got here without panicking - NaN was handled gracefully
+        // Note: The detection may or may not exist depending on how NaN affects max_by
+        // The key is that the code didn't crash
+        let _ = results;
+    }
+
+    #[test]
+    fn test_best_class_score_ignores_nan() {
+        // A NaN score must never win selection: the valid class in the row is kept.
+        let (idx, score) = best_class_score(&ndarray::arr1(&[0.9_f32, f32::NAN]).view());
+        assert_eq!(idx, 0);
+        assert!((score - 0.9).abs() < 1e-6);
+        let (idx, score) = best_class_score(&ndarray::arr1(&[f32::NAN, 0.8_f32]).view());
+        assert_eq!(idx, 1);
+        assert!((score - 0.8).abs() < 1e-6);
+        // All-NaN scores below any threshold (even 0.0), so the row is never emitted.
+        assert!(
+            !best_class_score(&ndarray::arr1(&[f32::NAN, f32::NAN]).view())
+                .1
+                .is_finite()
+        );
+        // Empty scores fall back to class 0 with a rejected (non-finite) score.
+        let empty: ndarray::Array1<f32> = ndarray::arr1(&[]);
+        let (idx, score) = best_class_score(&empty.view());
+        assert_eq!(idx, 0);
+        assert!(!score.is_finite());
+    }
+
+    #[test]
+    fn test_malformed_shape_fallback() {
+        // Test that malformed shapes return empty results instead of panicking
+        let output: Vec<f32> = vec![0.0; 100]; // Some data
+
+        let preprocess = unit_preprocess((640, 640));
+        let config = InferenceConfig::default();
+
+        // Empty and single-dimension shapes should not panic
+        for shape in [&[][..], &[100][..]] {
+            let results = postprocess_detect(
+                &output,
+                shape,
+                &preprocess,
+                &config,
+                results_for(0, (640, 640), (640, 640)),
+            );
+            assert!(results.is_empty(), "shape {shape:?}");
+        }
+    }
+
+    #[test]
+    fn test_postprocess_pose_logic() {
+        // Mock output for pose: [1, 56, 100]
+        // 56 features = 4 bbox + 1 class + 51 keypoints (17*3)
+        let num_preds = 100;
+        let num_features = 56;
+        let mut output = vec![0.0; num_preds * num_features];
+
+        // Fill one prediction
+        let idx = 0;
+        // BBox: cx, cy, w, h
+        output[idx] = 100.0;
+        output[idx + num_preds] = 100.0;
+        output[idx + num_preds * 2] = 50.0;
+        output[idx + num_preds * 3] = 50.0;
+        // Class score
+        output[idx + num_preds * 4] = 0.9;
+        // Keypoints: 17 * 3
+        for k in 0..17 {
+            let offset = 5 + k * 3;
+            output[idx + num_preds * offset] = 100.0; // x
+            output[idx + num_preds * (offset + 1)] = 100.0; // y
+            output[idx + num_preds * (offset + 2)] = 0.8; // conf
+        }
+
+        // Shape [1, 56, 100]
+        let results = postprocess_pose(
+            &output,
+            &[1, num_features, num_preds],
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            results_for(1, (640, 640), (640, 640)),
+            17,
+            3,
+        );
+
+        assert!(results.keypoints.is_some());
+        let kpts = results.keypoints.unwrap();
+        assert_eq!(kpts.data.shape()[0], 1); // 1 detection
+        assert_eq!(kpts.data.shape()[1], 17); // 17 keypoints
+        assert_eq!(kpts.data.shape()[2], 3); // x, y, conf
+
+        #[allow(clippy::float_cmp)]
+        {
+            // Verify values
+            assert_eq!(kpts.data[[0, 0, 0]], 100.0);
+            assert_eq!(kpts.data[[0, 0, 2]], 0.8);
+        }
+    }
+
+    /// A non-COCO keypoint count must be honored instead of assuming 17x3. With the count
+    /// hardcoded, the extra keypoint columns were read as class scores, so every row cleared
+    /// the confidence threshold and keypoints were read from the wrong offset.
+    #[test]
+    fn test_postprocess_pose_custom_kpt_shape() {
+        // 21 keypoints x 3 channels, 1 class: 4 + 1 + 63 = 68 features.
+        let (nk, kpt_dim, num_preds) = (21, 3, 100);
+        let num_features = 4 + 1 + nk * kpt_dim;
+        let mut output = vec![0.0; num_preds * num_features];
+
+        // One real detection in column 0; every other column stays at zero confidence.
+        let col = |feat: usize| feat * num_preds;
+        output[col(0)] = 100.0; // cx
+        output[col(1)] = 100.0; // cy
+        output[col(2)] = 50.0; // w
+        output[col(3)] = 50.0; // h
+        output[col(4)] = 0.9; // class score
+        for k in 0..nk {
+            let off = 5 + k * kpt_dim;
+            output[col(off)] = 100.0; // x
+            output[col(off + 1)] = 110.0; // y
+            output[col(off + 2)] = 0.8; // visibility
+        }
+
+        let results = postprocess_pose(
+            &output,
+            &[1, num_features, num_preds],
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            results_for(1, (640, 640), (640, 640)),
+            nk,
+            kpt_dim,
+        );
+
+        let kpts = results.keypoints.expect("keypoints decoded");
+        assert_eq!(kpts.data.shape(), &[1, nk, kpt_dim]);
+        let boxes = results.boxes.expect("boxes decoded");
+        assert_eq!(boxes.len(), 1, "only one row clears the threshold");
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(boxes.cls()[0], 0.0, "class comes from the class column");
+            assert_eq!(kpts.data[[0, 0, 0]], 100.0);
+            assert_eq!(kpts.data[[0, 0, 1]], 110.0);
+            assert_eq!(kpts.data[[0, 0, 2]], 0.8);
+        }
+    }
+
+    /// A 2-channel export carries no visibility, so it must decode to `(N, K, 2)` rather than
+    /// being rejected for having "insufficient features".
+    #[test]
+    fn test_postprocess_pose_kpt_dim_two() {
+        let (nk, kpt_dim, num_preds) = (17, 2, 50);
+        let num_features = 4 + 1 + nk * kpt_dim; // 39
+        let mut output = vec![0.0; num_preds * num_features];
+
+        let col = |feat: usize| feat * num_preds;
+        output[col(0)] = 80.0;
+        output[col(1)] = 90.0;
+        output[col(2)] = 40.0;
+        output[col(3)] = 40.0;
+        output[col(4)] = 0.7;
+        for k in 0..nk {
+            let off = 5 + k * kpt_dim;
+            output[col(off)] = 80.0;
+            output[col(off + 1)] = 95.0;
+        }
+
+        let results = postprocess_pose(
+            &output,
+            &[1, num_features, num_preds],
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            results_for(1, (640, 640), (640, 640)),
+            nk,
+            kpt_dim,
+        );
+
+        let kpts = results.keypoints.expect("keypoints decoded");
+        assert_eq!(kpts.data.shape(), &[1, nk, kpt_dim]);
+        assert!(
+            kpts.conf().is_none(),
+            "a 2-channel layout has no visibility scores"
+        );
+    }
+
+    /// A head width that disagrees with the metadata must return empty rather than reading
+    /// keypoint columns as class scores. Here `kpt_shape (17, 3)` and one class expect 56
+    /// features but the head is 68 wide, which used to decode as 13 classes.
+    #[test]
+    fn test_postprocess_pose_head_width_mismatch_is_empty() {
+        let num_preds = 100;
+        let results = postprocess_pose(
+            &vec![0.5; 68 * num_preds],
+            &[1, 68, num_preds],
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            results_for(1, (640, 640), (640, 640)),
+            17,
+            3,
+        );
+        assert!(results.keypoints.is_none());
+        assert!(results.boxes.is_none());
+    }
+
+    /// Degenerate keypoint layouts are rejected rather than panicking on the offset math or
+    /// truncating channels `Keypoints` cannot store.
+    #[test]
+    fn test_postprocess_pose_rejects_degenerate_kpt_shape() {
+        for (nk, kpt_dim) in [(0, 3), (17, 1), (17, 4)] {
+            let results = postprocess_pose(
+                &vec![0.0; 5600],
+                &[1, 56, 100],
+                &unit_preprocess((640, 640)),
+                &InferenceConfig::default(),
+                results_for(1, (640, 640), (640, 640)),
+                nk,
+                kpt_dim,
+            );
+            assert!(results.keypoints.is_none(), "nk {nk}, kpt_dim {kpt_dim}");
+        }
+    }
+
+    #[test]
+    fn test_postprocess_pose_end2end_yolo26_layout() {
+        // YOLO26 end2end pose output: [1, max_det, 6 + 17*3] = [1, 300, 57],
+        // row-major, already in model-input pixels, sorted by confidence desc.
+        // Row = [x1, y1, x2, y2, conf, cls, (kx, ky, kconf) * 17].
+        let max_det = 300;
+        let feats = 6 + 17 * 3; // 57
+        let mut out = vec![0.0f32; max_det * feats];
+        let confs = [0.9f32, 0.6, 0.3]; // three real detections, then zeros
+        for (i, &conf) in confs.iter().enumerate() {
+            let base = i * feats;
+            out[base] = 100.0; // x1
+            out[base + 1] = 120.0; // y1
+            out[base + 2] = 200.0; // x2
+            out[base + 3] = 320.0; // y2
+            out[base + 4] = conf;
+            out[base + 5] = 0.0; // class 0 (person)
+            for k in 0..17 {
+                let off = base + 6 + k * 3;
+                out[off] = 150.0; // kx
+                out[off + 1] = 200.0; // ky
+                out[off + 2] = 0.9; // kconf
+            }
+        }
+
+        let results = postprocess_with_head(
+            vec![(out.as_slice(), vec![1, max_det, feats])],
+            Task::Pose,
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            make_names(1),
+            ndarray::Array3::zeros((640, 640, 3)),
+            "test.jpg".to_string(),
+            Speed::default(),
+            (640, 640),
+            true,          // end2end (yolo26)
+            Some((17, 3)), // kpt_shape
+            false,
+        );
+
+        let boxes = results.boxes.expect("end2end pose should produce boxes");
+        assert_eq!(boxes.data.shape()[0], 3, "three detections above conf 0.25");
+        let kpts = results
+            .keypoints
+            .expect("end2end pose should produce keypoints");
+        assert_eq!(kpts.data.shape(), [3, 17, 3]);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(kpts.data[[0, 0, 0]], 150.0); // kx passes through (scale 1, pad 0)
+            assert_eq!(kpts.data[[0, 0, 2]], 0.9); // kconf
+        }
+    }
+
+    #[test]
+    fn test_postprocess_obb_logic() {
+        // Mock output for OBB: [1, 6, 100]
+        // 6 features = 4 bbox + 1 class + 1 angle
+        let num_preds = 100;
+        let num_features = 6;
+        let mut output = vec![0.0; num_preds * num_features];
+
+        // Fill one prediction
+        let idx = 0;
+        // BBox: cx, cy, w, h
+        output[idx] = 100.0;
+        output[idx + num_preds] = 100.0;
+        output[idx + num_preds * 2] = 50.0;
+        output[idx + num_preds * 3] = 20.0;
+        // Class score
+        output[idx + num_preds * 4] = 0.95;
+        // Angle
+        output[idx + num_preds * 5] = std::f32::consts::FRAC_PI_4; // 45 degrees
+
+        // Shape [1, 6, 100]
+        let results = postprocess_obb(
+            &output,
+            &[1, num_features, num_preds],
+            &unit_preprocess((640, 640)),
+            &InferenceConfig::default(),
+            results_for(1, (640, 640), (640, 640)),
+        );
+
+        assert!(results.obb.is_some());
+        let obb = results.obb.unwrap();
+        assert_eq!(obb.len(), 1);
+
+        // Verify values
+        let data = obb.data.row(0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(data[0], 100.0); // cx
+            assert_eq!(data[4], std::f32::consts::FRAC_PI_4); // angle
+            assert_eq!(data[5], 0.95); // conf
+        }
+    }
+
+    #[test]
+    fn test_postprocess_semantic_fast_path_argmax() {
+        // 2x2 image, 3 classes, no letterbox (lh==oh, lw==ow).
+        // Verify per-pixel argmax picks the right winning class.
+        let (oh, ow, nc) = (2, 2, 3);
+        let plane = oh * ow;
+        let mut output = vec![0.0f32; nc * plane];
+        // pixel (0,0): class 2 wins
+        output[0] = 0.1;
+        output[plane] = 0.2;
+        output[2 * plane] = 0.9;
+        // pixel (0,1): class 0 wins
+        output[1] = 0.8;
+        output[plane + 1] = 0.1;
+        output[2 * plane + 1] = 0.1;
+        // pixel (1,0): class 1 wins
+        output[2] = 0.3;
+        output[plane + 2] = 0.7;
+        output[2 * plane + 2] = 0.2;
+        // pixel (1,1): class 0 wins
+        output[3] = 0.5;
+        output[plane + 3] = 0.3;
+        output[2 * plane + 3] = 0.3;
+
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, oh, ow],
+            results_for(nc, (oh, ow), (oh as u32, ow as u32)),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        assert_eq!(sm.data[[0, 0]], 2);
+        assert_eq!(sm.data[[0, 1]], 0);
+        assert_eq!(sm.data[[1, 0]], 1);
+        assert_eq!(sm.data[[1, 1]], 0);
+        assert_eq!(sm.orig_shape(), (oh as u32, ow as u32));
+    }
+
+    #[test]
+    fn test_postprocess_semantic_binary_fast_path() {
+        // nc=1 (binary segmentation): a positive logit is foreground (1), anything else is
+        // background (0). Exactly 0.0 is not > 0, so it lands on background too.
+        let (oh, ow, nc) = (1, 5, 1);
+        let output = vec![1.0f32, -1.0, 0.001, -0.001, 0.0];
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, oh, ow],
+            results_for(2, (oh, ow), (oh as u32, ow as u32)),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(
+            sm.data.iter().copied().collect::<Vec<u16>>(),
+            [1, 0, 1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_postprocess_semantic_malformed_shape_no_panic() {
+        // Shape too short (needs at least 4 dims)
+        let r = postprocess_semantic(&[0.0f32; 10], &[1, 3], results_for(3, (4, 4), (4, 4)));
+        assert!(r.semantic_mask.is_none());
+
+        // Empty output slice
+        let r = postprocess_semantic(&[], &[1, 3, 4, 4], results_for(3, (4, 4), (4, 4)));
+        assert!(r.semantic_mask.is_none());
+    }
+
+    #[test]
+    fn test_postprocess_semantic_large_nc() {
+        // nc=33 exceeds the old 32-element stack buffer. Class 32 wins everywhere, through
+        // the fast path (lh==oh) and the letterbox bilinear path (a 2x4 image padded into
+        // 8x8: gain=2.0, 2 pad rows top and bottom, crop rows 2..6, no x padding).
+        const NC: usize = 33;
+        for (oh, ow, lh, lw) in [(2usize, 2usize, 2usize, 2usize), (2, 4, 8, 8)] {
+            let plane = lh * lw;
+            let mut output = vec![0.0f32; NC * plane];
+            output[32 * plane..].fill(1.0);
+            let result = postprocess_semantic(
+                &output,
+                &[1, NC, lh, lw],
+                results_for(NC, (oh, ow), (lh as u32, lw as u32)),
+            );
+            let sm = result.semantic_mask.unwrap();
+            assert_eq!(sm.data.shape(), &[oh, ow]);
+            assert!(sm.data.iter().all(|&v| v == 32), "{lh}x{lw} -> {oh}x{ow}");
+        }
+    }
+
+    #[test]
+    fn test_postprocess_semantic_binary_slow_path() {
+        // nc=1 binary through the letterbox bilinear path.
+        // oh=2, ow=4 letterboxed into 8x8 (same geometry as above).
+        let (oh, ow, lh, lw, nc) = (2, 4, 8, 8, 1);
+        let mut output = vec![1.0f32; lh * lw]; // all positive → class 1
+        // Flip 4 pixels in the content region (rows 2..6, col 0) to negative
+        for row in 2..6 {
+            output[row * lw] = -1.0;
+        }
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, lh, lw],
+            results_for(2, (oh, ow), (lh as u32, lw as u32)),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        // Col 0 pixels bilinearly interpolate negative logits → class 0
+        assert_eq!(sm.data[[0, 0]], 0);
+        assert_eq!(sm.data[[1, 0]], 0);
+        // Col 1+ pixels have positive logits → class 1
+        assert_eq!(sm.data[[0, 1]], 1);
+        assert_eq!(sm.data[[1, 1]], 1);
+    }
+
+    #[test]
+    fn test_postprocess_depth_passthrough() {
+        // Output already at original resolution: values copy straight into the depth map.
+        let (oh, ow) = (2, 3);
+        let output = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let result = postprocess_depth(
+            &output,
+            &[1, 1, oh, ow],
+            results_for(1, (oh, ow), (oh as u32, ow as u32)),
+        );
+        let depth = result.depth.unwrap();
+        assert_eq!(depth.data.shape(), <[usize; 2]>::from((oh, ow)));
+        assert!((depth.data[[0, 0]] - 1.0).abs() < 1e-6);
+        assert!((depth.data[[1, 2]] - 6.0).abs() < 1e-6);
+        assert!((depth.min_depth().unwrap() - 1.0).abs() < 1e-6);
+        assert!((depth.max_depth().unwrap() - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_postprocess_depth_stretch_resize() {
+        // oh=2, ow=4 wide image stretched into 8x8: no padding, so a constant map must
+        // survive the full-frame resize.
+        let (oh, ow, lh, lw) = (2, 4, 8, 8);
+        let output = vec![2.5f32; lh * lw];
+        let result = postprocess_depth(
+            &output,
+            &[1, 1, lh, lw],
+            results_for(1, (oh, ow), (lh as u32, lw as u32)),
+        );
+        let depth = result.depth.unwrap();
+        assert_eq!(depth.data.shape(), &[oh, ow]);
+        for &v in &depth.data {
+            assert!((v - 2.5).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_postprocess_depth_stretch_corners_align() {
+        // align_corners=True: a 2x2 ramp upsampled to 3x3 keeps its corners and midpoints.
+        let result = postprocess_depth(
+            &[0.0, 2.0, 4.0, 6.0],
+            &[1, 1, 2, 2],
+            results_for(1, (3, 3), (2, 2)),
+        );
+        let d = result.depth.unwrap().data;
+        assert!((d[[0, 0]] - 0.0).abs() < 1e-6 && (d[[2, 2]] - 6.0).abs() < 1e-6);
+        assert!((d[[1, 1]] - 3.0).abs() < 1e-6 && (d[[0, 1]] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_postprocess_depth_malformed_shape_no_panic() {
+        // Too-short shape and empty output must return an empty Results, not panic.
+        let result = postprocess_depth(&[], &[1], results_for(1, (2, 2), (2, 2)));
+        assert!(result.depth.is_none());
+    }
+
+    #[test]
+    fn test_postprocess_semantic_mask() {
+        // Fast path: pre-argmaxed u8 output already at the original resolution maps 1:1
+        // onto the u16 class map, in both the 2D [h, w] and 3D [1, h, w] layouts.
+        let (oh, ow) = (2, 3);
+        let output: Vec<u8> = vec![0, 5, 3, 7, 2, 19];
+        for shape in [vec![oh, ow], vec![1, oh, ow]] {
+            let result = postprocess_semantic_mask(
+                &output,
+                &shape,
+                make_names(20),
+                ndarray::Array3::zeros((oh, ow, 3)),
+                String::new(),
+                Speed::default(),
+                (oh as u32, ow as u32),
+            );
+            let sm = result.semantic_mask.unwrap();
+            assert_eq!(sm.data.shape(), &[oh, ow]);
+            assert_eq!(
+                sm.data.iter().copied().collect::<Vec<u16>>(),
+                [0, 5, 3, 7, 2, 19]
+            );
+            assert_eq!(sm.orig_shape(), (oh as u32, ow as u32));
+            assert_eq!(sm.classes_present(), 6);
+        }
+
+        // Slow path, plain upscale: a 4x4 mask of one class fills an 8x8 image.
+        let r = postprocess_semantic_mask(
+            &[5u8; 16],
+            &[1, 4, 4],
+            make_names(6),
+            ndarray::Array3::zeros((8, 8, 3)),
+            String::new(),
+            Speed::default(),
+            (8, 8),
+        );
+        let sm = r.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), [8, 8]);
+        assert!(sm.data.iter().all(|&v| v == 5));
+
+        // Slow path, letterboxed: a 2x4 wide image padded into 8x8 puts content in rows
+        // 2..6 (letterbox_crop_bounds -> top=2, left=0, crop 4x8). Padding rows carry a
+        // sentinel class that must be cropped away, so every output pixel is class 7.
+        let (oh, ow, lh, lw) = (2, 4, 8, 8);
+        let mut output = vec![99u8; lh * lw];
+        output[2 * lw..6 * lw].fill(7);
+        let result = postprocess_semantic_mask(
+            &output,
+            &[lh, lw],
+            make_names(100),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (lh as u32, lw as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        assert!(sm.data.iter().all(|&v| v == 7));
+
+        // Empty output yields no mask instead of panicking, at either rank.
+        for shape in [vec![4, 4], vec![1, 0, 0]] {
+            let r = postprocess_semantic_mask(
+                &[],
+                &shape,
+                make_names(10),
+                ndarray::Array3::zeros((4, 4, 3)),
+                String::new(),
+                Speed::default(),
+                (4, 4),
+            );
+            assert!(r.semantic_mask.is_none(), "shape {shape:?}");
+        }
+    }
+
+    #[test]
+    fn test_postprocess_semantic_batch_slice_per_image() {
+        // Simulate the batch-loop slicing in model.rs for a 2-image batch.
+        // Image 0: class 1 wins everywhere. Image 1: class 2 wins everywhere.
+        // Each image is 2×2 with nc=3 logits; batch output is nc*oh*ow per image.
+        let (oh, ow, nc) = (2, 2, 3);
+        let plane = oh * ow;
+        let elems_per_img = nc * plane;
+
+        let mut batch = vec![0.0f32; 2 * elems_per_img];
+        // Image 0 at offset 0: class 1 wins (logit 0.9 at channel 1).
+        for px in 0..plane {
+            batch[plane + px] = 0.9;
+        }
+        // Image 1 at offset elems_per_img: class 2 wins (logit 0.9 at channel 2).
+        for px in 0..plane {
+            batch[elems_per_img + 2 * plane + px] = 0.9;
+        }
+
+        for (i, expected_cls) in [(0usize, 1u16), (1, 2)] {
+            let start = i * elems_per_img;
+            let slice = &batch[start..start + elems_per_img];
+            let result = postprocess_semantic(
+                slice,
+                &[1, nc, oh, ow],
+                results_for(nc, (oh, ow), (oh as u32, ow as u32)),
+            );
+            let sm = result.semantic_mask.unwrap();
+            for &val in &sm.data {
+                assert_eq!(
+                    val, expected_cls,
+                    "image {i}: expected class {expected_cls} but got {val}"
+                );
+            }
+        }
+    }
+
+    fn unit_preprocess(orig: (u32, u32)) -> PreprocessResult {
+        PreprocessResult {
+            tensor: ndarray::Array4::zeros((1, 3, 640, 640)),
+            tensor_f16: None,
+            orig_shape: orig,
+            scale: (1.0, 1.0),
+            padding: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn test_end2end_shape_predicates() {
+        assert!(is_end2end_shape(&[1, 300, 6], 6));
+        assert!(!is_end2end_shape(&[1, 300, 7], 6));
+        assert!(!is_end2end_shape(&[1, 8400, 6], 6)); // > MAX_END2END_DETECTIONS
+        assert!(is_end2end_shape(&[1, 300, 7], 7));
+        assert!(!is_end2end_shape(&[1, 300, 6], 7));
+        assert!(is_end2end_shape(&[1, 300, 6 + 51], 6 + 17 * 3));
+        assert!(!is_end2end_shape(&[1, 300, 6 + 50], 6 + 17 * 3));
+        // Segment predicate needs proto channel count to disambiguate nm.
+        assert!(is_end2end_segment_shape(&[1, 300, 6 + 32], Some(32)));
+        assert!(!is_end2end_segment_shape(&[1, 300, 6 + 32], None));
+    }
+
+    #[test]
+    fn test_scale_and_clip_box_clips_to_bounds() {
+        let pre = unit_preprocess((50, 50));
+        // Box extends past the 50x50 image; expect clamping into [0, 50].
+        let out = scale_and_clip_box(&[-10.0, -10.0, 100.0, 100.0], &pre);
+        let expected = [0.0f32, 0.0, 50.0, 50.0];
+        for (o, e) in out.iter().zip(expected.iter()) {
+            assert!((o - e).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_output_to_2d_layouts() {
+        // Already [preds, features].
+        let a = output_to_2d(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3, true);
+        assert_eq!(a.shape(), [2, 3]);
+        assert!((a[[0, 0]] - 1.0).abs() < 1e-6);
+        // [features, preds] gets transposed to [preds, features].
+        let b = output_to_2d(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3, false);
+        assert_eq!(b.shape(), [2, 3]);
+        // Buffer too short -> empty array.
+        let c = output_to_2d(&[1.0, 2.0, 3.0], 2, 3, true);
+        assert!(c.is_empty());
+        // Buffer too long is also a mismatch: `ArrayView2::from_shape` would happily view the
+        // first 6 of these 8 values, silently decoding with the wrong stride.
+        let d = output_to_2d(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 2, 3, true);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn test_letterbox_crop_bounds() {
+        // Square model matching square image -> no padding, full crop.
+        assert_eq!(letterbox_crop_bounds(64, 64, 64, 64), Some((0, 0, 64, 64)));
+        // Wide image letterboxed into a square has vertical padding (top > 0).
+        let (top, left, ch, cw) = letterbox_crop_bounds(64, 64, 32, 64).unwrap();
+        assert!(top > 0 && left == 0 && ch > 0 && cw == 64);
+        // Degenerate zero-size returns None instead of panicking.
+        assert_eq!(letterbox_crop_bounds(0, 64, 32, 64), None);
+    }
+
+    #[test]
+    fn test_postprocess_classify_softmax_and_passthrough() {
+        // Logits (sum != 1) get softmaxed; argmax index is preserved.
+        let r = postprocess_classify(&[1.0, 2.0, 3.0], results_for(3, (8, 8), (8, 8)));
+        let probs = r.probs.unwrap();
+        assert_eq!(probs.top1(), 2);
+        assert!((probs.data.sum() - 1.0).abs() < 1e-5);
+
+        // Already-normalized probabilities pass through unchanged.
+        let r = postprocess_classify(&[0.1, 0.2, 0.7], results_for(3, (8, 8), (8, 8)));
+        assert!((r.probs.unwrap().top1conf() - 0.7).abs() < 1e-6);
+
+        // Empty output -> no probs.
+        let r = postprocess_classify(&[], results_for(3, (8, 8), (8, 8)));
+        assert!(r.probs.is_none());
+
+        // All-negative logits sum to a negative number, which used to skip softmax entirely
+        // and store the raw logits, so `top1conf` reported something like -3.0.
+        let r = postprocess_classify(&[-5.0, -3.0, -8.0], results_for(3, (8, 8), (8, 8)));
+        let probs = r.probs.unwrap();
+        assert_eq!(probs.top1(), 1, "the largest logit still wins");
+        let conf = probs.top1conf();
+        assert!(
+            (0.0..=1.0).contains(&conf),
+            "confidence must be a probability, got {conf}"
+        );
+        assert!((probs.data.sum() - 1.0).abs() < 1e-5);
+
+        // A vector that sums to ~1 but holds a negative value is not a distribution either.
+        let r = postprocess_classify(&[-0.5, 0.5, 1.0], results_for(3, (8, 8), (8, 8)));
+        let probs = r.probs.unwrap();
+        assert!(probs.data.iter().all(|&v| (0.0..=1.0).contains(&v)));
+        assert!((probs.data.sum() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_postprocess_detect_end2end_thresholds() {
+        // Row0 above threshold, row1 below -> only one detection kept.
+        let output = [
+            10.0, 10.0, 50.0, 50.0, 0.9, 0.0, // keep
+            10.0, 10.0, 20.0, 20.0, 0.1, 0.0, // drop (sorted-desc break)
+        ];
+        let r = postprocess_detect_end2end(
+            &output,
+            &[1, 2, 6],
+            &unit_preprocess((100, 100)),
+            &InferenceConfig::default(), // conf threshold 0.25
+            results_for(1, (100, 100), (640, 640)),
+            None,
+        );
+        assert_eq!(r.boxes.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_postprocess_detect_rtdetr_normalized_boxes() {
+        // RT-DETR row: [cx, cy, w, h] normalized to the 640x640 input, then scaled back
+        // onto a 200x400 source by the scale-fill gains. A centered box half the input wide
+        // and a quarter tall covers 200x50 of the source, so it lands at [100, 75, 300, 125].
+        let output = [0.5, 0.5, 0.5, 0.25, 0.9, 0.0];
+        let pre = PreprocessResult {
+            scale: (640.0 / 200.0, 640.0 / 400.0),
+            ..unit_preprocess((200, 400))
+        };
+        let r = postprocess_with_head(
+            vec![(output.as_slice(), vec![1, 1, 6])],
+            Task::Detect,
+            &pre,
+            &InferenceConfig::default(),
+            make_names(1),
+            ndarray::Array3::zeros((200, 400, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            true,
+        );
+        let boxes = r.boxes.expect("rtdetr row above threshold");
+        let xyxy = boxes.xyxy();
+        let row = xyxy.row(0);
+        assert!(
+            (row[0] - 100.0).abs() < 1e-3
+                && (row[1] - 75.0).abs() < 1e-3
+                && (row[2] - 300.0).abs() < 1e-3
+                && (row[3] - 125.0).abs() < 1e-3,
+            "got {row:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_multiclass_nms_and_class_filter() {
+        // nc=2 -> features = 6. Three predictions, [features, preds] layout:
+        //   pred0: class0 @0.90, pred1: class0 @0.85 (overlaps pred0 -> NMS-suppressed),
+        //   pred2: class1 @0.95 (distinct location).
+        let pre = unit_preprocess((256, 256));
+        let output = vec![
+            50.0f32, 52.0, 200.0, // cx
+            50.0, 52.0, 200.0, // cy
+            40.0, 40.0, 40.0, // w
+            40.0, 40.0, 40.0, // h
+            0.9, 0.85, 0.1, // class0 scores
+            0.1, 0.2, 0.95, // class1 scores
+        ];
+
+        // Default config: overlapping same-class boxes are suppressed -> 2 kept.
+        let r = postprocess_detect(
+            &output,
+            &[1, 6, 3],
+            &pre,
+            &InferenceConfig::default(),
+            results_for(2, (256, 256), (640, 640)),
+        );
+        let boxes = r.boxes.expect("detections");
+        assert_eq!(boxes.len(), 2);
+
+        // Class filter keeps only class 1 -> a single detection.
+        let config = InferenceConfig::default().with_classes(vec![1]);
+        let r = postprocess_detect(
+            &output,
+            &[1, 6, 3],
+            &pre,
+            &config,
+            results_for(2, (256, 256), (640, 640)),
+        );
+        let boxes = r.boxes.expect("detections");
+        assert_eq!(boxes.len(), 1);
+        assert!((boxes.cls()[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dispatch_detect_standard() {
+        let names = make_names(1); // nc=1 -> features = 5
+        let pre = unit_preprocess((100, 100));
+        let config = InferenceConfig::default();
+        // [1, 5, 1]: [cx, cy, w, h, class_score]
+        let output = vec![50.0f32, 50.0, 20.0, 20.0, 0.9];
+        let r = postprocess_with_head(
+            vec![(&output, vec![1, 5, 1])],
+            Task::Detect,
+            &pre,
+            &config,
+            names,
+            ndarray::Array3::zeros((100, 100, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(r.boxes.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_dispatch_classify_and_obb() {
+        let pre = unit_preprocess((100, 100));
+        let config = InferenceConfig::default();
+        let img = ndarray::Array3::zeros((100, 100, 3));
+
+        let probs = vec![0.1f32, 0.2, 0.7];
+        let r = postprocess_with_head(
+            vec![(&probs, vec![1, 3])],
+            Task::Classify,
+            &pre,
+            &config,
+            make_names(3),
+            img.clone(),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(r.probs.unwrap().top1(), 2);
+
+        // OBB standard route: [1, 6, 1] = [cx, cy, w, h, class_score, angle]
+        let obb_out = vec![50.0f32, 50.0, 20.0, 10.0, 0.9, 0.0];
+        let r = postprocess_with_head(
+            vec![(&obb_out, vec![1, 6, 1])],
+            Task::Obb,
+            &pre,
+            &config,
+            make_names(1),
+            img,
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(r.obb.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_dispatch_segment_with_protos() {
+        let names = make_names(1); // nc=1, nm from proto = 2 -> features = 7
+        let pre = unit_preprocess((16, 16));
+        let config = InferenceConfig::default();
+
+        // output0 [1, 7, 1] feature-major: [cx, cy, w, h, score, coeff0, coeff1]
+        let det = vec![8.0f32, 8.0, 6.0, 6.0, 0.9, 0.3, 0.7];
+        // protos [1, 2, 4, 4]
+        let protos = vec![0.5f32; 2 * 4 * 4];
+
+        let r = postprocess_with_head(
+            vec![(&det, vec![1, 7, 1]), (&protos, vec![1, 2, 4, 4])],
+            Task::Segment,
+            &pre,
+            &config,
+            names,
+            ndarray::Array3::zeros((16, 16, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            false,
+        );
+        let boxes = r.boxes.expect("segment yields detection boxes");
+        assert_eq!(boxes.len(), 1);
+        assert!(r.masks.is_some());
+    }
+
+    #[test]
+    fn test_dispatch_segment_end2end() {
+        let names = make_names(1); // nm from proto = 2 -> feats = 8
+        let pre = unit_preprocess((16, 16));
+        let config = InferenceConfig::default();
+        // output0 [1, 1, 8]: [x1, y1, x2, y2, conf, cls, coeff0, coeff1]
+        let det = vec![2.0f32, 2.0, 12.0, 12.0, 0.9, 0.0, 0.3, 0.7];
+        let protos = vec![0.5f32; 2 * 4 * 4];
+        let r = postprocess_with_head(
+            vec![(&det, vec![1, 1, 8]), (&protos, vec![1, 2, 4, 4])],
+            Task::Segment,
+            &pre,
+            &config,
+            names,
+            ndarray::Array3::zeros((16, 16, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            true, // force end2end segment path
+            None,
+            false,
+        );
+        assert_eq!(r.boxes.unwrap().len(), 1);
+        assert!(r.masks.is_some());
+    }
+
+    #[test]
+    fn test_dispatch_segment_missing_protos_is_empty() {
+        let det = vec![8.0f32, 8.0, 6.0, 6.0, 0.9, 0.3, 0.7];
+        let r = postprocess_with_head(
+            vec![(&det, vec![1, 7, 1])], // only one output, no protos
+            Task::Segment,
+            &unit_preprocess((16, 16)),
+            &InferenceConfig::default(),
+            make_names(1),
+            ndarray::Array3::zeros((16, 16, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            false,
+        );
+        assert!(r.masks.is_none());
+    }
+
+    /// A class count that disagrees with the real head width used to panic: `output_to_2d`
+    /// returns an empty array and `decode_row` indexed row 0 of it. Pose and obb already
+    /// guarded this; segment did not.
+    #[test]
+    fn test_dispatch_segment_feature_mismatch_is_empty() {
+        // Head is 4 + 80 + 32 = 116 wide, but the metadata carries a single class, so the
+        // expected feature count (37) cannot be reshaped from the buffer.
+        let num_preds = 40;
+        let det = vec![0.5f32; 116 * num_preds];
+        let protos = vec![0.0f32; 32 * 8 * 8];
+        let r = postprocess_with_head(
+            vec![
+                (&det, vec![1, 116, num_preds]),
+                (&protos, vec![1, 32, 8, 8]),
+            ],
+            Task::Segment,
+            &unit_preprocess((16, 16)),
+            &InferenceConfig::default(),
+            make_names(1),
+            ndarray::Array3::zeros((16, 16, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false,
+            None,
+            false,
+        );
+        assert!(r.masks.is_none());
+        assert!(r.boxes.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_dispatch_pose_end2end() {
+        let names = make_names(1);
+        let pre = unit_preprocess((100, 100));
+        let config = InferenceConfig::default();
+        let (nk, kd) = (17usize, 3usize);
+        let feats = 6 + nk * kd; // 57
+        // One detection: [x1, y1, x2, y2, conf, cls, kpts...]
+        let mut row = vec![10.0f32, 10.0, 50.0, 50.0, 0.9, 0.0];
+        for k in 0..nk {
+            row.push(20.0 + k as f32); // kx
+            row.push(30.0 + k as f32); // ky
+            row.push(0.8); // kconf
+        }
+        let r = postprocess_with_head(
+            vec![(&row, vec![1, 1, feats])],
+            Task::Pose,
+            &pre,
+            &config,
+            names,
+            ndarray::Array3::zeros((100, 100, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            true, // force end2end
+            Some((nk, kd)),
+            false,
+        );
+        assert_eq!(r.boxes.unwrap().len(), 1);
+        let kpts = r.keypoints.unwrap();
+        assert_eq!(kpts.data.shape(), [1, 17, 3]);
+    }
+
+    #[test]
+    fn test_dispatch_obb_end2end() {
+        let names = make_names(1);
+        let pre = unit_preprocess((100, 100));
+        let config = InferenceConfig::default();
+        // [1, 1, 7] layout: [cx, cy, w, h, conf, cls, angle]
+        let row = vec![50.0f32, 50.0, 20.0, 10.0, 0.9, 0.0, 0.3];
+        let r = postprocess_with_head(
+            vec![(&row, vec![1, 1, 7])],
+            Task::Obb,
+            &pre,
+            &config,
+            names,
+            ndarray::Array3::zeros((100, 100, 3)),
+            String::new(),
+            Speed::default(),
+            (640, 640),
+            false, // routed via is_end2end_shape (shape[2]==7)
+            None,
+            false,
+        );
+        assert_eq!(r.obb.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_dispatch_semantic_class_filter_ignores() {
+        // Two-class semantic logits [1, 2, 2, 2]; class filter keeps only class 0,
+        // so class-1 pixels become IGNORE.
+        let nc = 2;
+        let (h, w) = (2usize, 2usize);
+        // Channel-major logits: favor class 1 everywhere.
+        let mut logits = vec![0.0f32; nc * h * w];
+        for px in 0..(h * w) {
+            logits[h * w + px] = 5.0; // class-1 channel high
+        }
+        let config = InferenceConfig::new().with_classes(vec![0]);
+        let r = postprocess_with_head(
+            vec![(&logits, vec![1, nc, h, w])],
+            Task::Semantic,
+            &unit_preprocess((h as u32, w as u32)),
+            &config,
+            make_names(nc),
+            ndarray::Array3::zeros((h, w, 3)),
+            String::new(),
+            Speed::default(),
+            (h as u32, w as u32),
+            false,
+            None,
+            false,
+        );
+        let sm = r.semantic_mask.unwrap();
+        // All originally class-1 pixels are filtered out to IGNORE.
+        assert!(sm.data.iter().all(|&v| v == SemanticMask::IGNORE));
+    }
+}

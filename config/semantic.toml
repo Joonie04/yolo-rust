@@ -1,0 +1,21 @@
+# 语义分割示例（yolo26 独有）
+# 用法: cargo run -- config/semantic.toml
+
+[model]
+path = "models/sem/yolo26n-sem.onnx"
+
+[source]
+type = "image"
+path = "data/bus.jpg"
+
+[inference]
+device = "cpu"
+threads = 0
+
+[output]
+save_annotated = true
+save_json = true
+dir = "results"
+
+[logging]
+verbose = true

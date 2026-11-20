@@ -1,0 +1,22 @@
+# 工程基准（CPU 基线，yolo26m 中模型，用于验证 GPU 加速比随模型规模上升）。
+# 用法: cargo run -- bench config/bench_cpu_m.toml
+
+[model]
+path = "models/det/yolo26m.onnx"
+
+[source]
+type = "directory"
+path = "data/bench"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[bench]
+warmup = 3
+iterations = 20
+dir = "results/bench_cpu_m"

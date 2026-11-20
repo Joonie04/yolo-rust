@@ -1,0 +1,25 @@
+# 姿态估计示例
+# 用法: cargo run -- config/pose.toml
+
+[model]
+path = "models/pose/yolo26n-pose.onnx"
+
+[source]
+type = "image"
+path = "data/zidane.jpg"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[output]
+save_annotated = true
+save_json = true
+dir = "results"
+
+[logging]
+verbose = true

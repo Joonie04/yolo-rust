@@ -1,0 +1,27 @@
+# 精度评估示例（detect，COCO 标注）。
+# 用法: cargo run -- eval config/eval.toml
+# 输出: results/eval_report.json
+#
+# 本示例用 utils/make_synthetic_coco.py 生成的合成 COCO 集（真值 == 模型自身检测框），
+# 跑通应得 mAP@0.5 ≈ 1.0，用于端到端冒烟验证链路。
+#
+# 真实 COCO 等价性评估（对标 Ultralytics `model.val()`）时，把 conf 改为 0.001、
+# max_det=300、并把 dataset 指向你的 COCO 图片目录与 instances_val2017.json。
+
+[model]
+path = "models/det/yolo26n.onnx"
+
+[dataset]
+images = "data/eval/images"
+annotations = "data/eval/annotations.json"
+
+[inference]
+device = "cpu"
+conf = 0.25
+iou = 0.7
+max_det = 300
+threads = 0
+rect = true
+
+[eval]
+dir = "results"
