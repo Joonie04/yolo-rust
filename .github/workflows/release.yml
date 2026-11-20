@@ -1,0 +1,70 @@
+name: release
+
+# 预编译 CPU 二进制（自包含，静态链接 ONNX Runtime 核心，无需外带 DLL）。
+# 触发方式：
+#   - 推 tag（v*）→ 自动发 GitHub Release 并附带二进制
+#   - 手动 workflow_dispatch → 仅构建 + 上传 artifact（可在 Actions 页面下载，用于测试）
+#
+# 范围：x86_64 Windows + Linux（CPU）。aarch64（Jetson）/ GPU 后端不在本流水线：
+#   GPU 需目标机装对应 CUDA/TensorRT 运行时，应在目标机按 docs/deploy.md 从源码构建。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: yolo-rust
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: yolo-rust.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps (openssl for ort tls-native)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build (release, CPU, self-contained)
+        run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yolo-rust-${{ matrix.target }}
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release with binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/yolo-rust-x86_64-unknown-linux-gnu/yolo-rust
+            dist/yolo-rust-x86_64-pc-windows-msvc/yolo-rust.exe
