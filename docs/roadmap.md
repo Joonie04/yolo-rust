@@ -365,6 +365,24 @@
 - **统一报告（Markdown）已交付**：`utils/gen_report.py` 读取 `results/eval_report.json`（精度）+ `results/bench_*/bench_report.json`（工程）+ `data/equiv/*.json`（Python 参考）生成 `docs/report.md`，含 mAP 对齐四路对比表、80 类 per-class ΔAP 表（按 |Δap50| 降序，mean 0.0082 / max 0.062，2 类 >0.05）、跨后端基准表、延迟分解与关键发现。
 - **待续（部署项）**：接口形式已决策（服务器走 CLI 批处理，HTTP/gRPC/FFI 留到 Jetson）；服务器打包已交付并**在 AutoDL 部署目录实测通过**（`deploy/run.sh` + `deploy/Dockerfile` + `deploy/.dockerignore` + `docs/deploy.md`；`./run.sh bench` 出 CUDAExecutionProvider、total p50 ≈21ms/吞吐 ≈44 图/s，`./run.sh config/detect_cuda.toml` 出 5 检测；TensorRT EP 亦实测通过，FP32 p50 ≈15.6ms/吞吐 ≈55 图/s、FP16 p50 ≈15.5ms/吞吐 ≈58 图/s，见阶段 5）；仅剩 Jetson aarch64 打包 + Jetson 复测。部署组装已脚本化（`deploy/assemble.sh` 一键构建+组装，`deploy/run.sh` 自动探测 TensorRT lib）；服务器实测目前仅 detect，其余 6 任务的服务器 CUDA 冒烟配置已备好（`config/*_cuda.toml`）待有卡时逐条验证（见阶段 5）。
 
+### 阶段 7 — 开箱即用（1.0 → 1.5）
+
+**目标**：从「我能跑通」到「陌生人 clone 下来 10 分钟跑通自己的图」。
+
+**唯一判据**：陌生人 clone 仓库后，不装 Rust 工具链、10 分钟内跑通一张自己的图；跑不通就不是 1.5。
+
+**四支柱**：
+- ① 预编译二进制（Windows x64 / Linux x64 / aarch64），免装 Rust 工具链；
+- ② 一键 CLI：`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON；
+- ③ 主流 ONNX 模型后处理（v8 / v11 / v12 head）—— **已由底层库满足**（YOLOv8 / YOLO11 / YOLO26 + RT-DETR，见 `vendor/inference`）；
+- ④ Docker + 5 分钟上手 README + 一键复现 benchmark 脚本。
+
+**完成情况**：
+- **P0 ✅（2026-11-20）**：外层项目 git 化并首次推送 GitHub（`Joonie04/yolo-rust`）。结构整理：`references/` → `vendor/`（vendored 源码，入库）；`third_party/`（预编译二进制 + 下载缓存，gitignore）。重写 `.gitignore`（排除 520M 第三方二进制、`data/{coco2017,eval,equiv}`、`*.onnx/*.pt`、机器路径 `.cargo/config.toml`）。补顶层 `LICENSE`（AGPL-3.0）与 `.cargo/config.toml.example` 模板。
+- **P1（待做）**：① CPU 预编译二进制；② 一键 CLI；④ 陌生人 README + 一键 bench 脚本。
+- **P2（待做）**：Docker CPU 镜像、GitHub Actions 三平台 CI + Release。
+- **P3（待做）**：三平台二进制端到端 smoke。
+
 ---
 
 ## 6. 待确认事项（不阻塞前期阶段）
@@ -385,10 +403,12 @@
    ├── 阶段 1 全任务输出 ✅ ──→ 阶段 4 精度评估（全任务指标 ✅，等价性检测级 ✅） ──┐
    ├── 阶段 2 视频/流 ✅                                ├──→ 阶段 6 报告与部署
    └── 阶段 3 批量+基准 ✅ ──→ 阶段 5 GPU/性能 ✅（DirectML） ──┘
+                                                          └── 阶段 7 开箱即用 1.0→1.5（P0 ✅；P1 待做）
 ```
 
-- **推荐推进顺序**：1 → 3 → 4 → 5 → 2（视频可穿插）→ 6。
+- **推荐推进顺序**：1 → 3 → 4 → 5 → 2（视频可穿插）→ 6 → 7。
   - 先做 1（结构化输出）打通「所有任务都能出数据」；
   - 3（基准）建立「能测」的能力，是 5 的量化前提；
   - 4（精度）证明「做得对」，是量化的质量前提；
-  - 5（GPU）拿到性能收益；2（视频/流）随时可插入；最后 6 收口打包。
+  - 5（GPU）拿到性能收益；2（视频/流）随时可插入；6 收口打包；
+  - 7（开箱即用）是发布前的最后一步：P1 三件事（预编译二进制 / 一键 CLI / 陌生人 README）优先，P2（Docker/CI）、P3（smoke）随后。
