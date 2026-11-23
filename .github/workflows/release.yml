@@ -1,12 +1,15 @@
 name: release
 
-# 预编译 CPU 二进制（自包含，静态链接 ONNX Runtime 核心，无需外带 DLL）。
-# 触发方式：
-#   - 推 tag（v*）→ 自动发 GitHub Release 并附带二进制
-#   - 手动 workflow_dispatch → 仅构建 + 上传 artifact（可在 Actions 页面下载，用于测试）
+# 预编译 CPU 二进制。触发：推 tag v* 自动发 Release；workflow_dispatch 手动（仅构建 + artifact）。
 #
-# 范围：x86_64 Windows + Linux（CPU）。aarch64（Jetson）/ GPU 后端不在本流水线：
-#   GPU 需目标机装对应 CUDA/TensorRT 运行时，应在目标机按 docs/deploy.md 从源码构建。
+# 平台差异：
+#   - Linux   ：pyke 预编译包静态链接 ORT 核心 → 单文件自包含二进制。
+#   - Windows ：官方 ONNX Runtime 动态链接 → exe + DLL 打包成 zip。
+#     原因：ort-sys 的 copy_dylibs 在 Windows runner 上对 pyke 包做符号链接→拷贝回退时
+#     会 panic（fs::copy NotFound，见 vendor 依赖 ort-sys 2.0.0-rc.13 build/dynamic_link.rs），
+#     改用官方包（DLL 为普通文件）绕开。
+#
+# 范围：x86_64 CPU。aarch64（Jetson）/ GPU 后端不在此流水线（需目标机按 docs/deploy.md 源码构建）。
 
 on:
   push:
@@ -19,7 +22,6 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -27,9 +29,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: yolo-rust
+            archive: yolo-rust-linux-x64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: yolo-rust.exe
+            archive: yolo-rust-windows-x64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,17 +42,41 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux build deps (openssl for ort tls-native)
+      - name: Linux system deps (openssl for ort tls-native)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Build (release, CPU, self-contained)
+      - name: Windows — fetch official ONNX Runtime (dynamic link)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-win-x64-1.28.0.zip"
+          Invoke-WebRequest -Uri $url -OutFile ort.zip
+          Expand-Archive -Path ort.zip -DestinationPath ort
+          $lib = (Resolve-Path "ort/onnxruntime-win-x64-1.28.0/lib").Path
+          "ORT_LIB_LOCATION=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build (release)
         run: cargo build --release --locked
+
+      - name: Package Linux (single static binary → tar.gz)
+        if: runner.os == 'Linux'
+        run: tar czf ${{ matrix.archive }} -C target/release ${{ matrix.bin }}
+
+      - name: Package Windows (exe + DLLs → zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/yolo-rust.exe dist/
+          Copy-Item target/release/*.dll dist/
+          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.archive }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: yolo-rust-${{ matrix.target }}
-          path: target/release/${{ matrix.bin }}
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
           if-no-files-found: error
 
   release:
@@ -66,5 +94,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/yolo-rust-x86_64-unknown-linux-gnu/yolo-rust
-            dist/yolo-rust-x86_64-pc-windows-msvc/yolo-rust.exe
+            dist/yolo-rust-linux-x64.tar.gz/yolo-rust-linux-x64.tar.gz
+            dist/yolo-rust-windows-x64.zip/yolo-rust-windows-x64.zip

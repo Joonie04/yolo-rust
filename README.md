@@ -14,14 +14,14 @@ cargo run -- --model models/det/yolo26n.onnx --image data/bus.jpg
 控制台打印 `4 persons, 1 bus` 这类检测摘要，并在 `results/detect/<时间戳>/` 落盘 `results.json` + 标注图。
 （编译产物直接跑是 `yolo-rust --model <x.onnx> --image <y.jpg>`；可加 `--device cuda:0`、`--conf 0.25`、`--iou 0.7`。）
 
-**预编译二进制（免装 Rust 工具链）**：到 [Releases](https://github.com/Joonie04/yolo-rust/releases) 下载对应平台的 `yolo-rust`（Linux）或 `yolo-rust.exe`（Windows），即可直接运行：
+**预编译二进制（免装 Rust 工具链）**：到 [Releases](https://github.com/Joonie04/yolo-rust/releases) 下载对应平台的压缩包，解压后即可直接运行：
 
 ```bash
 # 模型不存在时会自动下载（yolo26n.onnx ~5MB）；--image 换成你自己的图
 yolo-rust --model yolo26n.onnx --image data/bus.jpg
 ```
 
-CPU 二进制为**单文件自包含**（已静态链接 ONNX Runtime，无需外带 DLL）；GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
+Linux 为**单文件自包含**（静态链接 ONNX Runtime）；Windows 为 zip（`yolo-rust.exe` + ONNX Runtime DLL，同目录运行）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
 
 完整用法（配置文件，功能最全）：
 
