@@ -1,0 +1,9 @@
+# Docker 构建上下文只保留源码 + vendored 库 + 配置，剔除大目录/产物。
+target
+third_party
+data
+models
+results
+.git
+*.onnx
+*.pt

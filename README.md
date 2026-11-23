@@ -25,6 +25,8 @@ yolo-rust --model yolo26n.onnx --image data/bus.jpg
 
 一键复现 CPU 基准：`scripts/bench.sh`（Linux/macOS）或 `scripts/bench.ps1`（Windows），自动下载模型 + 跑基准 + 出对比表。
 
+**Docker**（免装任何东西）：`docker run --rm -v "$PWD:/data" ghcr.io/joonie04/yolo-rust --model yolo26n.onnx --image data/bus.jpg`；或本机 `docker build -t yolo-rust .` 自建镜像。
+
 完整用法（配置文件，功能最全）：
 
 ```bash
