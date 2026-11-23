@@ -23,6 +23,8 @@ yolo-rust --model yolo26n.onnx --image data/bus.jpg
 
 两平台都是**单文件自包含**（静态链接 ONNX Runtime，解压后即可运行，无需外带任何 DLL）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
 
+一键复现 CPU 基准：`scripts/bench.sh`（Linux/macOS）或 `scripts/bench.ps1`（Windows），自动下载模型 + 跑基准 + 出对比表。
+
 完整用法（配置文件，功能最全）：
 
 ```bash

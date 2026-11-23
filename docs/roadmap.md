@@ -379,7 +379,7 @@
 
 **完成情况**：
 - **P0 ✅（2026-11-20）**：外层项目 git 化并首次推送 GitHub（`Joonie04/yolo-rust`）。结构整理：`references/` → `vendor/`（vendored 源码，入库）；`third_party/`（预编译二进制 + 下载缓存，gitignore）。重写 `.gitignore`（排除 520M 第三方二进制、`data/{coco2017,eval,equiv}`、`*.onnx/*.pt`、机器路径 `.cargo/config.toml`）。补顶层 `LICENSE`（AGPL-3.0）与 `.cargo/config.toml.example` 模板。
-- **P1 ✅（2026-11-23）**：② 一键 CLI ✅（`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON）；① CPU 预编译二进制 ✅（CI 通过，`v0.1.0` Release 产出 Windows zip / Linux tar.gz，两平台单文件自包含；`copy-dylibs` 移到 GPU feature 修复 Windows runner 的 ort-sys panic）；③ 多版本模型 ✅（底层库白送 YOLOv8/11/26 + RT-DETR）；④ 陌生人 README ✅（「最快上手」+「预编译二进制」指引）—— 一键 bench 脚本待做。
+- **P1 ✅（2026-11-23）**：② 一键 CLI ✅（`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON）；① CPU 预编译二进制 ✅（CI 通过，`v0.1.0` Release 产出 Windows zip / Linux tar.gz，两平台单文件自包含；`copy-dylibs` 移到 GPU feature 修复 Windows runner 的 ort-sys panic）；③ 多版本模型 ✅（底层库白送 YOLOv8/11/26 + RT-DETR）；④ 陌生人 README ✅（「最快上手」+「预编译二进制」指引）+ 一键 bench 脚本 ✅（`scripts/bench.sh` / `bench.ps1`，自动下模型 + 跑基准 + 出对比表）。
 - **P2（部分）**：CI + Release ✅（随 ① 完成）；Docker CPU 镜像（待做）。
 - **P3（待做）**：三平台二进制端到端 smoke（下载 Release 产物实测「陌生人 10 分钟」）。
 
