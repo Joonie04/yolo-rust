@@ -121,11 +121,14 @@ ab_glyph = { version = "^0.2", optional = true }
 # Native-only dependencies. None of these build for `wasm32-unknown-unknown`
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # ONNX Runtime 1.28.0
+# 注：copy-dylibs 已从基础 feature 移到 GPU feature（见下方 cuda/tensorrt/directml）。
+# 原因：CPU 静态构建无需拷贝 DirectML.dll（provider 插件运行时按需 LoadLibrary，CPU 推理不加载它，
+# 已验证），且 ort-sys 的 copy_dylibs 在 Windows CI runner 上对 pyke 包做符号链接→拷贝回退时
+# 会 fs::copy NotFound panic。移除后 CPU 二进制为真正的单文件自包含。
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "std",
     "ndarray",
     "download-binaries",
-    "copy-dylibs",
     "half",
     "tls-native",
     "num-complex",
@@ -155,8 +158,8 @@ video = ["dep:ffmpeg-next"]
 annotate = ["imageproc", "ab_glyph"]
 
 # NVIDIA GPU acceleration
-cuda = ["ort/cuda"]
-tensorrt = ["ort/tensorrt"]
+cuda = ["ort/cuda", "ort/copy-dylibs"]
+tensorrt = ["ort/tensorrt", "ort/copy-dylibs"]
 cuda-preprocess = ["cuda", "tensorrt", "dep:cudarc"]
 
 # AMD GPU acceleration
@@ -167,7 +170,7 @@ openvino = ["ort/api-22", "ort/preload-dylibs", "dep:hmac-sha256", "dep:flate2"]
 onednn = ["ort/onednn"]
 
 # DirectML (Windows)
-directml = ["ort/directml"]
+directml = ["ort/directml", "ort/copy-dylibs"]
 
 # Mobile/Embedded
 nnapi = ["ort/nnapi"]   # Android

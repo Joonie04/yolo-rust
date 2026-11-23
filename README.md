@@ -21,7 +21,7 @@ cargo run -- --model models/det/yolo26n.onnx --image data/bus.jpg
 yolo-rust --model yolo26n.onnx --image data/bus.jpg
 ```
 
-Linux 为**单文件自包含**（静态链接 ONNX Runtime）；Windows 为 zip（`yolo-rust.exe` + ONNX Runtime DLL，同目录运行）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
+两平台都是**单文件自包含**（静态链接 ONNX Runtime，解压后即可运行，无需外带任何 DLL）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
 
 完整用法（配置文件，功能最全）：
 

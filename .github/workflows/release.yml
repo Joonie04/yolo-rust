@@ -2,12 +2,9 @@ name: release
 
 # 预编译 CPU 二进制。触发：推 tag v* 自动发 Release；workflow_dispatch 手动（仅构建 + artifact）。
 #
-# 平台差异：
-#   - Linux   ：pyke 预编译包静态链接 ORT 核心 → 单文件自包含二进制。
-#   - Windows ：官方 ONNX Runtime 动态链接 → exe + DLL 打包成 zip。
-#     原因：ort-sys 的 copy_dylibs 在 Windows runner 上对 pyke 包做符号链接→拷贝回退时
-#     会 panic（fs::copy NotFound，见 vendor 依赖 ort-sys 2.0.0-rc.13 build/dynamic_link.rs），
-#     改用官方包（DLL 为普通文件）绕开。
+# 两平台都是 pyke 静态链接 ORT 核心 → 单文件自包含二进制（无需外带任何 DLL/.so）。
+# CPU 构建不启用 copy-dylibs（provider 插件 DLL 运行时按需加载，CPU 推理不需要），
+# 也因此避开了 ort-sys copy_dylibs 在 Windows runner 上的 panic。
 #
 # 范围：x86_64 CPU。aarch64（Jetson）/ GPU 后端不在此流水线（需目标机按 docs/deploy.md 源码构建）。
 
@@ -46,32 +43,17 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Windows — fetch official ONNX Runtime (dynamic link)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-win-x64-1.28.0.zip"
-          Invoke-WebRequest -Uri $url -OutFile ort.zip
-          Expand-Archive -Path ort.zip -DestinationPath ort
-          $lib = (Resolve-Path "ort/onnxruntime-win-x64-1.28.0/lib").Path
-          "ORT_LIB_LOCATION=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Build (release)
+      - name: Build (release, CPU, self-contained)
         run: cargo build --release --locked
 
-      - name: Package Linux (single static binary → tar.gz)
+      - name: Package Linux (single binary → tar.gz)
         if: runner.os == 'Linux'
         run: tar czf ${{ matrix.archive }} -C target/release ${{ matrix.bin }}
 
-      - name: Package Windows (exe + DLLs → zip)
+      - name: Package Windows (single exe → zip)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item target/release/yolo-rust.exe dist/
-          Copy-Item target/release/*.dll dist/
-          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.archive }}
+        run: Compress-Archive -Path target/release/${{ matrix.bin }} -DestinationPath ${{ matrix.archive }}
 
       - uses: actions/upload-artifact@v4
         with:
