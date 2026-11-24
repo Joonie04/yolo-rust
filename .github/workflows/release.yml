@@ -1,12 +1,14 @@
 name: release
 
-# 预编译 CPU 二进制。触发：推 tag v* 自动发 Release；workflow_dispatch 手动（仅构建 + artifact）。
+# 预编译二进制。触发：推 tag v* 自动发 Release；workflow_dispatch 手动（仅构建 + artifact）。
 #
-# 两平台都是 pyke 静态链接 ORT 核心 → 单文件自包含二进制（无需外带任何 DLL/.so）。
-# CPU 构建不启用 copy-dylibs（provider 插件 DLL 运行时按需加载，CPU 推理不需要），
-# 也因此避开了 ort-sys copy_dylibs 在 Windows runner 上的 panic。
+# 平台差异：
+#   - Linux   ：ubuntu:22.04 容器（glibc 2.35）内构建，官方 ORT 动态链接（manylinux_2_28 / glibc 2.28），
+#               产物 = 二进制 + libonnxruntime*.so + run.sh 的 tar.gz。原因：pyke 静态 ORT 用 GCC 13 +
+#               glibc 2.38 编译，在 Ubuntu 22.04（glibc 2.35）链接/运行都会失败，故用官方 ORT 绕开。
+#   - Windows ：pyke 静态链接 ORT 核心，单文件自包含（MSVC 自带运行时，无 glibc 问题）。
 #
-# 范围：x86_64 CPU。aarch64（Jetson）/ GPU 后端不在此流水线（需目标机按 docs/deploy.md 源码构建）。
+# 范围：x86_64 CPU。aarch64（Jetson）/ GPU 后端不在此流水线。
 
 on:
   push:
@@ -19,53 +21,81 @@ permissions:
   packages: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: yolo-rust
-            archive: yolo-rust-linux-x64.tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: yolo-rust.exe
-            archive: yolo-rust-windows-x64.zip
-    runs-on: ${{ matrix.os }}
+  build-linux:
+    name: build (linux x64, glibc 2.35)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    steps:
+      - name: Install build deps + Rust
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates git build-essential pkg-config libssl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+
+      - name: Download official ONNX Runtime (manylinux_2_28)
+        run: |
+          curl -fL --retry 3 -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz"
+          tar xzf ort.tgz
+          echo "ORT_LIB_LOCATION=$PWD/onnxruntime-linux-x64-1.28.0/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+
+      - name: Build (release, dynamic link, rpath=$ORIGIN)
+        run: cargo build --release --locked
+        env:
+          RUSTFLAGS: -C link-arg=-Wl,-rpath,$ORIGIN
+
+      - name: Bundle binary + runtime .so + run.sh
+        run: |
+          mkdir -p dist
+          cp target/release/yolo-rust dist/
+          cp -L onnxruntime-linux-x64-1.28.0/lib/libonnxruntime*.so* dist/
+          cat > dist/run.sh <<'EOF'
+          #!/usr/bin/env bash
+          # 兜底：若 rpath 未生效，用 LD_LIBRARY_PATH 让二进制找到同目录 .so。
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$DIR/yolo-rust" "$@"
+          EOF
+          chmod +x dist/yolo-rust dist/run.sh
+          tar czf yolo-rust-linux-x64.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yolo-rust-linux-x64.tar.gz
+          path: yolo-rust-linux-x64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: build (windows x64)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Linux system deps (openssl for ort tls-native)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+          targets: x86_64-pc-windows-msvc
 
       - name: Build (release, CPU, self-contained)
         run: cargo build --release --locked
 
-      - name: Package Linux (single binary → tar.gz)
-        if: runner.os == 'Linux'
-        run: tar czf ${{ matrix.archive }} -C target/release ${{ matrix.bin }}
-
-      - name: Package Windows (single exe → zip)
-        if: runner.os == 'Windows'
+      - name: Package (single exe → zip)
         shell: pwsh
-        run: Compress-Archive -Path target/release/${{ matrix.bin }} -DestinationPath ${{ matrix.archive }}
+        run: Compress-Archive -Path target/release/yolo-rust.exe -DestinationPath yolo-rust-windows-x64.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: yolo-rust-windows-x64.zip
+          path: yolo-rust-windows-x64.zip
           if-no-files-found: error
 
   release:
     name: publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

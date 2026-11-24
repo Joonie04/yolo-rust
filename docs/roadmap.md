@@ -379,7 +379,7 @@
 
 **完成情况**：
 - **P0 ✅（2026-11-20）**：外层项目 git 化并首次推送 GitHub（`Joonie04/yolo-rust`）。结构整理：`references/` → `vendor/`（vendored 源码，入库）；`third_party/`（预编译二进制 + 下载缓存，gitignore）。重写 `.gitignore`（排除 520M 第三方二进制、`data/{coco2017,eval,equiv}`、`*.onnx/*.pt`、机器路径 `.cargo/config.toml`）。补顶层 `LICENSE`（AGPL-3.0）与 `.cargo/config.toml.example` 模板。
-- **P1 ✅（2026-11-23）**：② 一键 CLI ✅（`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON）；① CPU 预编译二进制 ✅（CI 通过，`v0.1.0` Release 产出 Windows zip / Linux tar.gz，两平台单文件自包含；`copy-dylibs` 移到 GPU feature 修复 Windows runner 的 ort-sys panic）；③ 多版本模型 ✅（底层库白送 YOLOv8/11/26 + RT-DETR）；④ 陌生人 README ✅（「最快上手」+「预编译二进制」指引）+ 一键 bench 脚本 ✅（`scripts/bench.sh` / `bench.ps1`，自动下模型 + 跑基准 + 出对比表）。
+- **P1 ✅（2026-11-23）**：② 一键 CLI ✅（`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON）；① CPU 预编译二进制 ✅（CI 通过，`v0.1.0` Release；Windows 单文件静态、Linux 官方 ORT 动态「二进制 + .so」，兼容 glibc 2.35+/22.04；`copy-dylibs` 移到 GPU feature 修复 Windows runner 的 ort-sys panic）；③ 多版本模型 ✅（底层库白送 YOLOv8/11/26 + RT-DETR）；④ 陌生人 README ✅（「最快上手」+「预编译二进制」指引）+ 一键 bench 脚本 ✅（`scripts/bench.sh` / `bench.ps1`，自动下模型 + 跑基准 + 出对比表）。
 - **P2（进行中）**：CI + Release ✅（随 ① 完成）；Docker CPU 镜像 ✅ 已交付（多阶段 `Dockerfile` + `.dockerignore` + GHCR CI），构建推送待下次 tag 实测。
 - **P3 ✅（2026-11-23，Windows）**：下载 `v0.1.0` Windows zip（单文件 40MB exe）→ 干净目录跑 `yolo-rust.exe --model yolo26n.onnx --image bus.jpg` → 自动下载模型（9.5MB）+ 出 `4 persons, 1 bus` + 落 JSON。**「陌生人 10 分钟跑通」判据成立**。Linux 二进制 CI 已构建，运行时 smoke 待 Linux 环境实测。
 
