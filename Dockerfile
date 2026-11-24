@@ -20,9 +20,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app
 COPY . .
 RUN curl -fL --retry 3 -o ort.tgz \
-        "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz" \
+        "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz" \
     && tar xzf ort.tgz \
-    && ORT_LIB_LOCATION=/app/onnxruntime-linux-x64-1.28.0/lib \
+    && ORT_LIB_LOCATION=/app/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib \
        ORT_PREFER_DYNAMIC_LINK=1 \
        cargo build --release --locked
 
@@ -30,7 +30,8 @@ FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/yolo-rust /usr/local/bin/yolo-rust
-COPY --from=builder /app/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime*.so* /usr/local/lib/
+COPY --from=builder /app/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime.so* /usr/local/lib/
+COPY --from=builder /app/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime_providers_shared.so /usr/local/lib/
 RUN ldconfig
 WORKDIR /data
 ENTRYPOINT ["yolo-rust"]

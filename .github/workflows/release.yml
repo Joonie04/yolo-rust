@@ -36,11 +36,11 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Download official ONNX Runtime (manylinux_2_28)
+      - name: Download official ONNX Runtime (gpu_cuda13, manylinux_2_28)
         run: |
-          curl -fL --retry 3 -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz"
+          curl -fL --retry 3 -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz"
           tar xzf ort.tgz
-          echo "ORT_LIB_LOCATION=$PWD/onnxruntime-linux-x64-1.28.0/lib" >> "$GITHUB_ENV"
+          echo "ORT_LIB_LOCATION=$PWD/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
 
       - name: Build (release, dynamic link, rpath=$ORIGIN)
@@ -52,7 +52,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/yolo-rust dist/
-          cp -L onnxruntime-linux-x64-1.28.0/lib/libonnxruntime*.so* dist/
+          # 只带主库（含符号链接链 .so → .so.1 → .so.1.28.0）+ providers_shared，不带 cuda/tensorrt provider
+          cp -P onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime.so* dist/
+          cp -P onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime_providers_shared.so dist/
           cat > dist/run.sh <<'EOF'
           #!/usr/bin/env bash
           # 兜底：若 rpath 未生效，用 LD_LIBRARY_PATH 让二进制找到同目录 .so。
