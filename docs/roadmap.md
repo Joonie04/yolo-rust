@@ -380,8 +380,11 @@
 **完成情况**：
 - **P0 ✅（2026-11-20）**：外层项目 git 化并首次推送 GitHub（`Joonie04/yolo-rust`）。结构整理：`references/` → `vendor/`（vendored 源码，入库）；`third_party/`（预编译二进制 + 下载缓存，gitignore）。重写 `.gitignore`（排除 520M 第三方二进制、`data/{coco2017,eval,equiv}`、`*.onnx/*.pt`、机器路径 `.cargo/config.toml`）。补顶层 `LICENSE`（AGPL-3.0）与 `.cargo/config.toml.example` 模板。
 - **P1 ✅（2026-11-23）**：② 一键 CLI ✅（`yolo-rust --model x.onnx --image y.jpg` → 出框 + JSON）；① CPU 预编译二进制 ✅（CI 通过，`v0.1.0` Release；Windows 单文件静态、Linux pyke 静态单文件需 glibc 2.39+/24.04+——官方 ORT 1.28.0 无 manylinux 发布，做不了 22.04 便携版；`copy-dylibs` 移到 GPU feature 修复 Windows runner 的 ort-sys panic）；③ 多版本模型 ✅（底层库白送 YOLOv8/11/26 + RT-DETR）；④ 陌生人 README ✅（「最快上手」+「预编译二进制」指引）+ 一键 bench 脚本 ✅（`scripts/bench.sh` / `bench.ps1`，自动下模型 + 跑基准 + 出对比表）。
-- **P2（进行中）**：CI + Release ✅（随 ① 完成）；Docker CPU 镜像 ✅ 已交付（多阶段 `Dockerfile` + `.dockerignore` + GHCR CI），构建推送待下次 tag 实测。
-- **P3 ✅（2026-11-23，Windows）**：下载 `v0.1.0` Windows zip（单文件 40MB exe）→ 干净目录跑 `yolo-rust.exe --model yolo26n.onnx --image bus.jpg` → 自动下载模型（9.5MB）+ 出 `4 persons, 1 bus` + 落 JSON。**「陌生人 10 分钟跑通」判据成立**。Linux 二进制 CI 已构建，运行时 smoke 待 Linux 环境实测。
+- **P2 ✅（2026-11-24）**：CI + Release ✅（`v0.1.1` 三 job 全绿：Linux 单文件 + Windows 单文件 + Docker 镜像推 GHCR，大小写已修）；Docker CPU 镜像 ✅（多阶段 `Dockerfile` + `.dockerignore` + GHCR CI，pyke 静态 + ubuntu:24.04）。
+- **P3 ✅（2026-11-23，Windows）**：下载 `v0.1.0` Windows zip（单文件 40MB exe）→ 干净目录跑 `yolo-rust.exe --model yolo26n.onnx --image bus.jpg` → 自动下载模型（9.5MB）+ 出 `4 persons, 1 bus` + 落 JSON。**「陌生人 10 分钟跑通」判据成立**。Linux 二进制 CI 已构建（需 glibc 2.39+/24.04+；22.04 走 bundled CPU 库从源码构建，见 README）。
+- **bundled CPU ORT 库（2026-11-24）**：官方 ORT 1.28.0 的 GitHub/PyPI 发布已 404，故把 CPU 推理需要的 `libonnxruntime.so`（glibc 2.28）提取压缩成 9.8MB `third_party/onnxruntime-cpu-1.28.0.tgz` 入库，供 22.04 等旧 glibc 从源码构建（CUDA provider 279MB 超 GitHub 100MB 限制未入库）。
+
+**阶段 7 结论 ✅**：1.5「开箱即用」里程碑完成。四支柱（预编译二进制 / 一键 CLI / 多版本模型 / Docker+README+bench）全部落地；Windows 端到端实测通过，Linux 因 ORT 1.28.0 无 manylinux 官方发布而限定 glibc 2.39+（22.04 走 bundled 库源码构建）。
 
 ---
 
