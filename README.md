@@ -21,7 +21,7 @@ cargo run -- --model models/det/yolo26n.onnx --image data/bus.jpg
 yolo-rust --model yolo26n.onnx --image data/bus.jpg
 ```
 
-Linux 为 `yolo-rust` + `libonnxruntime*.so` + `run.sh` 的 tar.gz（官方 ORT 动态链接，兼容 glibc 2.35+ / Ubuntu 22.04+）；Windows 为**单文件自包含** exe（静态链接，MSVC 自带运行时）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
+两平台都是**单文件自包含**（静态链接 ONNX Runtime）。Windows 解压即用；Linux 需 glibc 2.39+（Ubuntu 24.04+，因 pyke 静态 ORT 用新工具链编译，官方 1.28.0 无 manylinux 发布）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
 
 一键复现 CPU 基准：`scripts/bench.sh`（Linux/macOS）或 `scripts/bench.ps1`（Windows），自动下载模型 + 跑基准 + 出对比表。
 

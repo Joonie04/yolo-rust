@@ -67,7 +67,7 @@ cargo clippy --all-targets
 
 - **`deploy/assemble.sh`**：一键「构建 + 组装」自包含部署目录（`--tensorrt` / `--cuda` / `--skip-build`，`DEP`/`ORT_LIB` 可用环境变量覆盖），自动排除 `data/` 里 `coco2017/eval/equiv` 大目录、删除 `.pt` 只留 `.onnx`。
 - **`deploy/run.sh`**：部署目录入口，固化 `LD_LIBRARY_PATH`（含 TensorRT 自动探测）并从自身目录启动。
-- **预编译二进制（CI）**：`.github/workflows/release.yml` 在推 tag `v*` 时构建 Windows/Linux x64 CPU 二进制并发 GitHub Release；`workflow_dispatch` 可手动触发（仅构建 + 上传 artifact）。Linux：`ubuntu:22.04` 容器（glibc 2.35）+ 官方 ORT 动态链接（manylinux_2_28；**用 `gpu_cuda13` 包，1.28.0 无纯 CPU Linux 包**，其 `libonnxruntime.so` 含 CPU EP），产物 = 二进制 + `libonnxruntime*.so` + `run.sh` 的 tar.gz；Windows：pyke 静态链接、单文件自包含（MSVC 自带运行时）。`copy-dylibs` 从 CPU 基础 feature 移到 GPU feature（CPU 不需要 provider DLL，且绕开 Windows runner 的 copy_dylibs panic）。GPU 后端仍需目标机按 `docs/deploy.md` 源码构建。
+- **预编译二进制（CI）**：`.github/workflows/release.yml` 在推 tag `v*` 时构建 Windows/Linux x64 CPU 二进制并发 GitHub Release；`workflow_dispatch` 可手动触发（仅构建 + 上传 artifact）。两平台均 pyke 静态链接、单文件自包含；Linux 构建在 ubuntu-24.04（glibc 2.39），二进制需 glibc 2.39+（Ubuntu 24.04+）——官方 ORT 1.28.0 无 GitHub/PyPI manylinux 发布，做不了 22.04 便携版，22.04 用 `docs/deploy.md` 的 assemble.sh。`copy-dylibs` 从 CPU 基础 feature 移到 GPU feature。GPU 后端仍需目标机按 `docs/deploy.md` 源码构建。
 - **Docker（CI）**：根 `Dockerfile`（多阶段：`rust:1-slim` builder 编译 → `debian:bookworm-slim` runtime）+ `.dockerignore`；release workflow 推 tag 时构建并推送 GHCR。`docker run --rm -v "$PWD:/data" ghcr.io/<owner>/yolo-rust --model yolo26n.onnx --image data/bus.jpg`。
 - 完整部署/验证清单见 `docs/deploy.md`；分阶段路线图与完成状态见 `docs/roadmap.md`。
 

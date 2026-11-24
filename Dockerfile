@@ -1,4 +1,4 @@
-# CPU 推理镜像（多阶段：builder 编译 → runtime 只含二进制 + 官方 ORT 动态库）。
+# CPU 推理镜像（多阶段：builder 编译 → runtime 只含二进制）。
 #
 # 用法：
 #   docker build -t yolo-rust .
@@ -7,11 +7,11 @@
 # 预构建镜像（推 tag 时自动发到 GHCR）：见 .github/workflows/release.yml。
 #
 # 说明：
-#   - builder 用 ubuntu:22.04（glibc 2.35）+ 官方 ORT 动态链接（manylinux_2_28 / glibc 2.28），
-#     绕开 pyke 静态 ORT 需 glibc 2.38+ / GCC 13 的问题（见 docs/roadmap.md 阶段 7）。
-#   - runtime 装 libssl3（下载模型需 TLS）+ ca-certificates，并把 libonnxruntime*.so 放进系统库路径。
+#   - builder/runtime 用 ubuntu:24.04（glibc 2.39）：pyke 静态 ORT 用 GCC 13 + glibc 2.38 编译，
+#     需 glibc ≥ 2.38 才能链接/运行。
+#   - runtime 装 libssl3（下载模型需 TLS）+ ca-certificates。二进制为单文件（静态链接 ORT）。
 
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -19,19 +19,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app
 COPY . .
-RUN curl -fL --retry 3 -o ort.tgz \
-        "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz" \
-    && tar xzf ort.tgz \
-    && ORT_LIB_LOCATION=/app/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib \
-       ORT_PREFER_DYNAMIC_LINK=1 \
-       cargo build --release --locked
+RUN cargo build --release --locked
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/yolo-rust /usr/local/bin/yolo-rust
-COPY --from=builder /app/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime.so* /usr/local/lib/
-COPY --from=builder /app/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime_providers_shared.so /usr/local/lib/
-RUN ldconfig
 WORKDIR /data
 ENTRYPOINT ["yolo-rust"]

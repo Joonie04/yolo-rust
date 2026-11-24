@@ -1,11 +1,12 @@
 name: release
 
-# 预编译二进制。触发：推 tag v* 自动发 Release；workflow_dispatch 手动（仅构建 + artifact）。
+# 预编译 CPU 二进制。触发：推 tag v* 自动发 Release；workflow_dispatch 手动（仅构建 + artifact）。
 #
 # 平台差异：
-#   - Linux   ：ubuntu:22.04 容器（glibc 2.35）内构建，官方 ORT 动态链接（manylinux_2_28 / glibc 2.28），
-#               产物 = 二进制 + libonnxruntime*.so + run.sh 的 tar.gz。原因：pyke 静态 ORT 用 GCC 13 +
-#               glibc 2.38 编译，在 Ubuntu 22.04（glibc 2.35）链接/运行都会失败，故用官方 ORT 绕开。
+#   - Linux   ：ubuntu-24.04（glibc 2.39）上 pyke 静态链接 ORT 核心，单文件自包含。
+#               限制：pyke 静态 ORT 用 GCC 13 + glibc 2.38 编译，二进制需 glibc 2.39+（Ubuntu 24.04+）。
+#               官方 ORT 1.28.0 无 GitHub/PyPI 发布（只有 pyke 静态构建），故无法做 manylinux 便携版。
+#               Ubuntu 22.04 请用 docs/deploy.md 的 deploy/assemble.sh 从源码构建。
 #   - Windows ：pyke 静态链接 ORT 核心，单文件自包含（MSVC 自带运行时，无 glibc 问题）。
 #
 # 范围：x86_64 CPU。aarch64（Jetson）/ GPU 后端不在此流水线。
@@ -22,48 +23,23 @@ permissions:
 
 jobs:
   build-linux:
-    name: build (linux x64, glibc 2.35)
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:22.04
+    name: build (linux x64, glibc 2.39+)
+    runs-on: ubuntu-24.04
     steps:
-      - name: Install build deps + Rust
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates git build-essential pkg-config libssl-dev
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - uses: actions/checkout@v4
 
-      - name: Download official ONNX Runtime (gpu_cuda13, manylinux_2_28)
-        run: |
-          curl -fL --retry 3 -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-gpu_cuda13-1.28.0.tgz"
-          tar xzf ort.tgz
-          echo "ORT_LIB_LOCATION=$PWD/onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib" >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
 
-      - name: Build (release, dynamic link, rpath=$ORIGIN)
+      - name: Linux system deps (openssl for ort tls-native)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build (release, CPU, self-contained)
         run: cargo build --release --locked
-        env:
-          RUSTFLAGS: -C link-arg=-Wl,-rpath,$ORIGIN
 
-      - name: Bundle binary + runtime .so + run.sh
-        run: |
-          mkdir -p dist
-          cp target/release/yolo-rust dist/
-          # 只带主库（含符号链接链 .so → .so.1 → .so.1.28.0）+ providers_shared，不带 cuda/tensorrt provider
-          cp -P onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime.so* dist/
-          cp -P onnxruntime-linux-x64-gpu_cuda13-1.28.0/lib/libonnxruntime_providers_shared.so dist/
-          cat > dist/run.sh <<'EOF'
-          #!/usr/bin/env bash
-          # 兜底：若 rpath 未生效，用 LD_LIBRARY_PATH 让二进制找到同目录 .so。
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          exec "$DIR/yolo-rust" "$@"
-          EOF
-          chmod +x dist/yolo-rust dist/run.sh
-          tar czf yolo-rust-linux-x64.tar.gz -C dist .
+      - name: Package (single binary → tar.gz)
+        run: tar czf yolo-rust-linux-x64.tar.gz -C target/release yolo-rust
 
       - uses: actions/upload-artifact@v4
         with:
@@ -132,7 +108,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/joonie04/yolo-rust:latest
+            ghcr.io/joonie04/yolo-rust:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
