@@ -78,6 +78,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: yolo-rust-*
           path: dist
 
       - name: Publish release with binaries
