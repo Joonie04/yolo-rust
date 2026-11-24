@@ -23,6 +23,27 @@ yolo-rust --model yolo26n.onnx --image data/bus.jpg
 
 两平台都是**单文件自包含**（静态链接 ONNX Runtime）。Windows 解压即用；Linux 需 glibc 2.39+（Ubuntu 24.04+，因 pyke 静态 ORT 用新工具链编译，官方 1.28.0 无 manylinux 发布）。GPU（CUDA/TensorRT/DirectML）需在目标机按 `docs/deploy.md` 从源码构建。
 
+**非 24.04（如 Ubuntu 22.04）从源码构建**：仓库已 bundled CPU 版官方 ORT 库（`third_party/onnxruntime-cpu-1.28.0.tgz`，glibc 2.28 的 `libonnxruntime.so`）：
+
+```bash
+tar xzf third_party/onnxruntime-cpu-1.28.0.tgz
+cd onnxruntime-cpu-1.28.0/lib
+ln -sf libonnxruntime.so.1.28.0 libonnxruntime.so.1
+ln -sf libonnxruntime.so.1 libonnxruntime.so
+cd ../..
+export ORT_LIB_LOCATION="$PWD/onnxruntime-cpu-1.28.0/lib"
+export ORT_PREFER_DYNAMIC_LINK=1
+cargo build --release
+```
+
+运行时需让二进制找到 `libonnxruntime.so.1`（动态链接）：
+
+```bash
+LD_LIBRARY_PATH="$PWD/onnxruntime-cpu-1.28.0/lib" target/release/yolo-rust --model yolo26n.onnx --image data/bus.jpg
+```
+
+（CUDA provider 279MB 太大未入库；GPU 构建按 `docs/deploy.md` 用完整官方 `gpu_cuda13` 包。）
+
 一键复现 CPU 基准：`scripts/bench.sh`（Linux/macOS）或 `scripts/bench.ps1`（Windows），自动下载模型 + 跑基准 + 出对比表。
 
 **Docker**（免装任何东西）：`docker run --rm -v "$PWD:/data" ghcr.io/joonie04/yolo-rust --model yolo26n.onnx --image data/bus.jpg`；或本机 `docker build -t yolo-rust .` 自建镜像。

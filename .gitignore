@@ -8,7 +8,9 @@
 /release
 
 # 预编译第三方二进制 + 下载缓存（体积大，走脚本拉取，不入库）
-/third_party
+/third_party/*
+# 例外：bundled 的 CPU 版官方 ORT 库（glibc 2.28，供 22.04 等旧系统从源码构建用）
+!/third_party/onnxruntime-cpu-1.28.0.tgz
 
 # 机器相关构建配置（含绝对路径 LIBCLANG_PATH，见 .cargo/config.toml.example 模板）
 /.cargo/config.toml
